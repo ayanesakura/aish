@@ -58,6 +58,37 @@ def via_target(machine, api):
         return None
 
 
+def stale_machines(machines, target, runs, api):
+    """同一实验下、指向其他 run 且该 run 已不在运行中的已注册机器（只报告，不移除）。"""
+    status = {str(run.get("id")): str(run.get("status")) for run in runs}
+    stale = []
+    for machine in machines:
+        other = via_target(machine, api)
+        if not other or identity(other)[:3] != identity(target)[:3] or other.run == target.run:
+            continue
+        state = status.get(str(other.run), "不在最近的 run 列表中")
+        if state != "Running":
+            stale.append({"machine": machine["name"], "run": other.run, "pod": other.pod, "status": state})
+    return stale
+
+
+def resolve_target(name, latest, api, jar):
+    """机器名或 URL → 固定 run/pod 的目标。--latest 时先解析实验下最新的运行中 run，再固定到它。"""
+    target, _ = api.host_target(name, {})
+    try:
+        canonical_url(target)
+    except ValueError as error:
+        raise api.AishError(str(error))
+    if latest:
+        jar = jar or api.CookieJar(target.base, allow_browser=True)
+        api.resolve_latest(target, jar)
+        target.follow = False
+    elif target.follow:
+        raise api.AishError(f"别名 {name} 会跟随最新 run，而 Herdr 机器必须固定到一个 pod。"
+                            "加 --latest 接入当前最新的运行中 run，或提供 pod 的 WebShell URL。")
+    return target
+
+
 def shell_config(text):
     document = tomlkit.parse(text)
     if "shell" in document:
@@ -163,22 +194,20 @@ class Connector:
 
 def connect(argv, api):
     parser = argparse.ArgumentParser(prog="aish herdr", description="一句命令接入原生 Herdr 远端 space")
-    parser.add_argument("target", help="WebShell URL，或固定目标的 aish 别名")
+    parser.add_argument("target", help="WebShell URL，或 aish 别名（跟随最新 run 的别名需加 --latest）")
+    parser.add_argument("--latest", action="store_true",
+                        help="接入实验下最新的运行中 run（训练换了 run 之后用），并固定到解析出的 pod")
     parser.add_argument("--name", help="新机器的名称（默认根据 pod 身份生成）")
     parser.add_argument("--folder", help="pod 上的工作目录（默认 verl、workspace 或 HOME）")
     args = parser.parse_args(argv)
-    target, _ = api.host_target(args.target, {})
-    if target.follow:
-        raise api.AishError("请提供新 pod 的 WebShell URL，或用 aish add --pin 保存的固定别名。")
-    try:
-        canonical_url(target)
-    except ValueError as error:
-        raise api.AishError(str(error))
     tools = {name: shutil.which(name) for name in ("uv", "hc", "herdr-app")}
     missing = [name for name, path in tools.items() if not path]
     if missing:
         raise api.AishError("本机缺少命令：" + ", ".join(missing))
-    api.CookieJar(target.base, allow_browser=True).get()
+    base = api.host_target(args.target, {})[0].base
+    jar = api.CookieJar(base, allow_browser=True)
+    jar.get()
+    target = resolve_target(args.target, args.latest, api, jar)
     lock_path = Path.home() / ".config/ais-webshell/herdr-connect.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a") as lock:
@@ -186,6 +215,17 @@ def connect(argv, api):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise api.AishError("另一个 Herdr 接入任务正在执行，请等待其完成后重试。")
-        result = Connector(api, tools).attach(target, args.name, args.folder)
+        connector = Connector(api, tools)
+        result = connector.attach(target, args.name, args.folder)
+        try:
+            result["stale_machines"] = stale_machines(
+                connector.data("hc", "machine", "ls")["machines"], target, api.list_runs(target, jar), api)
+        except api.AishError as error:
+            result["stale_machines"] = []
+            result["warnings"].append(f"未能检查同一实验下的旧机器：{error}")
+        for stale in result["stale_machines"]:
+            result["warnings"].append(
+                f"机器 {stale['machine']} 指向的 run {stale['run']} 状态为 {stale['status']}，它的 pod 应已回收；"
+                f"确认不再需要后可运行 hc machine rm {stale['machine']} 移除（本次没有改动它）。")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

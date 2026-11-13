@@ -31,7 +31,7 @@ class PipeTests(unittest.TestCase):
         cookie.write_text("mockcookie123456")
         cls.env = dict(os.environ, AIS_BASE_URL=f"http://127.0.0.1:{cls.port}",
                        AIS_TOKEN_FILE=str(cookie), AISH_HOSTS_FILE=str(cls.directory / "hosts.json"),
-                       AISH_NO_BROWSER_COOKIE="1", MOCK_KEEP_OPEN="1", TMUX_TMPDIR=str(cls.directory / "tmux"))
+                       AISH_NO_BROWSER_COOKIE="1", AISH_NO_NOTIFY="1", MOCK_KEEP_OPEN="1", TMUX_TMPDIR=str(cls.directory / "tmux"))
         cls.remote_env = dict(cls.env, HC_SESSION="r", HC_SOCKET=str(cls.directory / "r"),
                               XDG_CONFIG_HOME=str(cls.directory / "remote-config"),
                               XDG_DATA_HOME=str(cls.directory / "remote-data"),

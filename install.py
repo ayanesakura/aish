@@ -1,15 +1,17 @@
-"""Install a versioned runtime and one shared skill for Codex and Claude Code."""
+"""Install a versioned runtime, the aish and herdr-pod commands, and one shared skill for Codex and Claude Code."""
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
+import sys
 import tempfile
 
 
 SOURCE = Path(__file__).resolve().parent
-FILES = ("aish.py", "aish_pipe.py", "aish_remote.py", "aish_herdr.py",
+FILES = ("aish.py", "aish_pipe.py", "aish_remote.py", "aish_herdr.py", "aish_doctor.py",
          "remote/herdr_setup.py", "skills/herdr-pod/SKILL.md",
          "skills/herdr-pod/agents/openai.yaml")
 
@@ -39,8 +41,9 @@ def install(home=None):
         raise RuntimeError("本机缺少 uv；请安装后重试")
     contents = {name: (SOURCE / name).read_bytes() for name in FILES}
     launcher = '#!/bin/sh\nexec ' + shlex.quote(uv) + ' run --quiet --script ' + shlex.quote(
-        str(root / "current/aish.py")) + ' herdr "$@"\n'
-    contents["herdr-pod"] = launcher.encode()
+        str(root / "current/aish.py"))
+    commands = {"aish": launcher + ' "$@"\n', "herdr-pod": launcher + ' herdr "$@"\n'}
+    contents.update({name: text.encode() for name, text in commands.items()})
     digest = hashlib.sha256()
     for name, content in sorted(contents.items()):
         digest.update(name.encode() + b"\0" + content + b"\0")
@@ -50,6 +53,7 @@ def install(home=None):
         root / "current": release,
         home / ".agents/skills/herdr-pod": skill,
         home / ".claude/skills/herdr-pod": skill,
+        home / ".local/bin/aish": root / "current/aish",
         home / ".local/bin/herdr-pod": root / "current/herdr-pod",
     }
     for path, target in links.items():
@@ -67,12 +71,14 @@ def install(home=None):
                 path = staging / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
-            (staging / "herdr-pod").chmod(0o755)
+            for name in commands:
+                (staging / name).chmod(0o755)
             staging.rename(release)
     previous = str((root / "current").resolve()) if (root / "current").exists() else None
     for path, target in links.items():
         replace_link(path, target)
     return {"runtime": str(release), "previous_runtime": previous,
+            "aish": str(home / ".local/bin/aish"),
             "command": str(home / ".local/bin/herdr-pod"),
             "codex_skill": str(home / ".agents/skills/herdr-pod"),
             "claude_skill": str(home / ".claude/skills/herdr-pod")}
@@ -81,5 +87,7 @@ def install(home=None):
 if __name__ == "__main__":
     try:
         print(json.dumps(install(), ensure_ascii=False, indent=2))
+        if str(Path.home() / ".local/bin") not in os.environ.get("PATH", "").split(os.pathsep):
+            print("注意：~/.local/bin 不在 PATH 中，请把它加进 shell 配置后再使用 aish / herdr-pod。", file=sys.stderr)
     except (OSError, RuntimeError) as error:
         raise SystemExit(str(error))

@@ -10,12 +10,16 @@ mac 和 pod 之间没有直连网络，aish 走的是平台网页 WebShell 背�
 - **cookie 自动获取**：直接读取本机 Chrome 里的 `ais_token`，过期了也会自动刷新。
 
 ## 安装
-需要 [uv](https://docs.astral.sh/uv/)。依赖（websockets、cryptography）在第一次运行时自动安装。
-Python 入口是 `aish.py`，`aish` 只是调用它的两行 shell 启动器；`aish_pipe.py` 和 `aish_remote.py` 必须放在同一目录。也可始终使用 `uv run --script /绝对路径/aish.py`。
+需要 [uv](https://docs.astral.sh/uv/)。依赖（websockets、cryptography、tomlkit）在第一次运行时自动安装。
 ```bash
 git clone https://github.com/ayanesakura/aish.git ~/aish
-echo 'alias aish=~/aish/aish' >> ~/.zshrc && source ~/.zshrc
+cd ~/aish && python3 install.py
 ```
+`install.py` 把当前代码复制成一个带版本号的 runtime（`~/.local/share/aish/releases/<版本>`，`current` 指向它），并在 `~/.local/bin` 里放两个命令：`aish` 和 `herdr-pod`（见下方「一句话接入 Herdr」），同时安装 Claude Code / Codex 共用的 skill。需要 `~/.local/bin` 在 PATH 中。
+
+- **更新**：`git pull` 后重跑 `python3 install.py`。`aish`、`herdr-pod` 和 skill 一起切到新版本；已经注册到 Herdr 的机器仍然用注册时的那个版本，不受影响。
+- **开发**：直接运行仓库里的 `./aish`（调用同目录 `aish.py` 的两行启动器），改了代码立即生效。不要把日常用的 `aish` 别名指到仓库，否则终端里的 `aish` 和 Herdr 用的版本会不一致。
+- 遇到不是本工具创建的同名文件（比如已有的 `~/.local/bin/aish`），安装会拒绝覆盖并说明是哪个文件。
 
 ## 日常用法
 ```bash
@@ -59,7 +63,15 @@ aish gpu --run 2459535             # 临时连接指定的 run（不跟随）
 aish add gpu2 '<URL>' --tmux cc    # 保存时指定 tmux 会话名；--no-tmux 表示保存为普通 shell
 aish '<URL>'                       # 不保存，直接用 URL（默认是普通 shell，加 --tmux NAME 用 tmux）
 aish login                         # 手动从 Chrome 刷新 cookie
+aish doctor                        # 一次检查 cookie、保存的机器、Herdr 远端机器和 pod 环境
 ```
+
+### 出问题时：aish doctor
+`aish doctor`（或 `aish doctor gpu` 只看一台）只读地检查并逐项给出结论和修复办法，有问题时退出码为 1：
+- 本机有没有 `uv`、`hc`、`herdr-app`，装的是哪个 runtime；
+- cookie 文件在不在、平台还认不认（它不读浏览器，看到的就是 Herdr 后台连接看到的状态）；
+- 每台保存的机器：实验下有没有运行中的 run，固定的 run 是否还在；
+- 每台通过 aish 接入 Herdr 的机器：传输命令里的脚本是否还存在、指向的 run 是否还在运行、是否已连接、往返耗时，以及 pod 上有没有 `python3`、`bash`、`tmux`、`claude`、`node`。
 
 ## cookie
 - aish 从 `~/.config/ais-webshell/ais_token` 读取 cookie（600 权限，只存值；可以用 `AIS_TOKEN_FILE` 指定别的路径）。
@@ -67,24 +79,27 @@ aish login                         # 手动从 Chrome 刷新 cookie
   - 第一次读取时 macOS 会弹出钥匙串授权（「Chrome Safe Storage」），点「始终允许」即可。
   - 前提是 Chrome 里登录着 AI Studio。cookie 过期了，就在浏览器里重新登录一次。
 - 不想让它读浏览器：加 `--no-browser-cookie`，或者设置 `AISH_NO_BROWSER_COOKIE=1`。
+- Herdr 的后台连接（`--pipe`）不读浏览器，避免后台进程弹出钥匙串授权。平台拒绝它的请求时（多半是登录失效；平台对无效 cookie 返回的不一定是 401，所以无法和平台故障严格区分），它会发一条 macOS 通知（10 分钟内最多一条；`AISH_NO_NOTIFY=1` 关闭）。看到后在浏览器重新登录，再运行 `aish login`，Herdr 下次重连就会恢复；仍不行就运行 `aish doctor`。
 - cookie 和 token 不会出现在任何输出里（`-v` 调试输出也会打码）。
 
 ## 一句话接入 Herdr（Claude Code / Codex 共用）
 
-安装一次全局命令和共享 skill：
-
-```sh
-python3 install_herdr_skill.py
-```
-
-之后在 Claude Code 或 Codex 中说：**把这个 pod 接入 Herdr：`<WebShell URL>`**。
+按上面「安装」运行过 `python3 install.py` 后，在 Claude Code 或 Codex 中说：**把这个 pod 接入 Herdr：`<WebShell URL>`**。
 也可以在终端直接运行：
 
 ```sh
-~/.local/bin/herdr-pod '<WebShell URL>'
+herdr-pod '<WebShell URL>'
 # 指定 pod 上的目录时：
-~/.local/bin/herdr-pod '<WebShell URL>' --folder /workspace/verl
+herdr-pod '<WebShell URL>' --folder /workspace/verl
+# 训练换了 run 之后：不用再去平台复制 URL，直接接入保存的别名所在实验的最新 pod
+herdr-pod gpu --latest
 ```
+`herdr-pod` 等价于 `aish herdr`。
+
+### 训练换了 run 之后
+Herdr 的远端机器固定在一个 pod 上，不会自己跟到新 run（否则断线重连可能悄悄连到另一台机器）。换 run 后运行 `herdr-pod gpu --latest`：它查出实验下最新的运行中 run，选同一角色的 pod（如 `master-0`），注册一台新机器并创建新 space。`--latest` 也可以配合旧 pod 的 URL 使用。
+
+结果里的 `stale_machines` 和 `warnings` 会列出同一实验下指向已结束 run 的旧机器。它们不会被自动移除；确认不再需要后运行 `hc machine rm <机器名>`。
 
 脚本会固定当前 pod，自动注册原生远端机器、安装 Herdr Core、检查 Bash/Node、创建独立远端 space 并切换过去。同一 pod 和目录重复执行会复用 space；不同 pod 分别注册，不覆盖旧连接。新 space 优先接入 tmux `main`，没有它才启动已安装的 Claude。未安装 Claude 时打开远端 shell 并返回警告；不会自动改认证或安装 Claude/Node。
 
@@ -92,7 +107,7 @@ python3 install_herdr_skill.py
 
 安装产物在 `~/.local/share/aish/releases/`，`current` 指向当前版本；旧版本保留，已注册机器的传输命令固定到具体版本。共享 skill 链接在 `~/.agents/skills/herdr-pod`（Codex）和 `~/.claude/skills/herdr-pod`（Claude Code）。若当前对话未发现新 skill，开启新会话；命令行入口安装后即可使用。更新后重跑安装命令即可；遇到非本工具已有文件会拒绝覆盖。
 
-需要本机已安装 `uv`、`hc`、`herdr-app`，Herdr 正在运行，浏览器已登录 AI Studio，pod 提供 Python 3 和 Bash。认证失效时先运行 `uv run --script ~/.local/share/aish/current/aish.py login`，再重试。结果 JSON 中的 `warnings` 表示剩余环境问题；原生绑定成功不代表 Claude 认证或模型 API 已验证。
+需要本机已安装 `uv`、`hc`、`herdr-app`，Herdr 正在运行，浏览器已登录 AI Studio，pod 提供 Python 3 和 Bash。认证失效时先运行 `aish login`，再重试；不确定是哪里的问题就运行 `aish doctor`。结果 JSON 中的 `warnings` 表示剩余环境问题；原生绑定成功不代表 Claude 认证或模型 API 已验证。
 
 开发时可直接运行 `uv run --script aish.py herdr '<WebShell URL>'`，但长期使用请先安装，避免机器注册依赖临时开发目录。
 
@@ -162,6 +177,12 @@ python3 dev/pipe_test.py
 - pod 如果用了 hostNetwork，`hostname` 显示的是节点名。
 
 ## 开发测试（不连生产 pod）
+自动化测试（GitHub Actions 在每次推送和 PR 时也跑这一组）：
+```bash
+dev/run_tests.sh    # herdr_test（接入逻辑、安装）、doctor_test（doctor、登录失效通知）、pipe_test（管道传输，自带 mock）
+```
+交互式流程的测试需要手动起 mock：
+
 `dev/mock_server.py` 在本机模拟 webshellUrl / opsws / opsresize，后端是本机 bash 的 pty（二进制帧故意拆开 UTF-8；`MOCK_KEEP_OPEN=1` 模拟真实网关「shell 退出后不关 WS」；tmux 用 `/tmp/aish-mock-tmux` 隔离）。
 ```bash
 MOCK_KEEP_OPEN=1 dev/mock_server.py 18765 /tmp/mock.log &
