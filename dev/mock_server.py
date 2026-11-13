@@ -52,6 +52,11 @@ async def handler(ws):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["PS1"] = "mock$ "
+        os.environ["TERM"] = "xterm"
+        os.environ["LANG"] = os.environ["LC_ALL"] = "en_US.UTF-8"
+        os.environ.pop("TMUX", None)
+        # 独立的 tmux socket 目录，和本机平时用的 tmux 隔离
+        os.environ["TMUX_TMPDIR"] = "/tmp/aish-mock-tmux"  # unix socket 路径有长度上限
         os.environ["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
         os.execv("/bin/bash", ["bash", "--norc", "--noprofile", "-i"])
     setsize(fd, int(q.get("cols", 80)), int(q.get("rows", 24)))

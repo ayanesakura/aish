@@ -90,7 +90,7 @@ elif mode == "hold":
     send("~."); step("发送 ~.")
 elif mode == "sigterm":
     quiet(2.0)
-    pid = subprocess.run(["pgrep", "-f", "python.*outputs/aish"], capture_output=True, text=True).stdout.split()[0]
+    pid = subprocess.run(["pgrep", "-f", "python.*/aish"], capture_output=True, text=True).stdout.split()[0]
     os.kill(int(pid), 15); step(f"向本地 aish(pid {pid}) 发送 SIGTERM")
 elif mode == "drop":
     quiet(2.0)
