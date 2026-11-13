@@ -13,8 +13,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import aish
-from aish_herdr import Connector, canonical_url, identity, machine_name, shell_config, via_target
-import install_herdr_skill
+from aish_herdr import (Connector, canonical_url, identity, machine_name, resolve_target, shell_config,
+                        stale_machines, via_target)
+import install as installer
 
 spec = importlib.util.spec_from_file_location("herdr_setup", Path(__file__).resolve().parents[1] / "remote/herdr_setup.py")
 setup = importlib.util.module_from_spec(spec)
@@ -100,6 +101,43 @@ class OnboardingTests(unittest.TestCase):
         with patch.object(aish, "load_hosts", return_value={"gpu": {"url": URL, "follow": True}}):
             self.assertIsNone(via_target(machine, aish))
 
+    def test_following_alias_needs_latest(self):
+        hosts = {"gpu": {"url": URL, "follow": True}}
+        with patch.object(aish, "load_hosts", return_value=hosts):
+            with self.assertRaises(aish.AishError) as raised:
+                resolve_target("gpu", False, aish, None)
+            self.assertIn("--latest", str(raised.exception))
+
+            def newest(target, jar):
+                target.run, target.pod = "9", "run-9-master-0"
+
+            with patch.object(aish, "resolve_latest", side_effect=newest) as resolved:
+                target = resolve_target("gpu", True, aish, object())
+            resolved.assert_called_once()
+        self.assertFalse(target.follow)
+        self.assertEqual((target.run, target.pod), ("9", "run-9-master-0"))
+        self.assertIn("runId=9", canonical_url(target))
+
+    def test_pinned_url_resolves_without_network(self):
+        with patch.object(aish, "resolve_latest", side_effect=AssertionError("must not query")):
+            target = resolve_target(URL, False, aish, None)
+        self.assertEqual(target.run, "3")
+
+    def test_stale_machines_only_reports_ended_runs_of_same_experiment(self):
+        def machine(name, run, experiment="2"):
+            url = URL.replace("runId=3", f"runId={run}").replace("run-3-", f"run-{run}-")
+            return {"name": name, "via": True,
+                    "target": shlex.join(["uv", "run", "--script", "/x/aish.py",
+                                          url.replace("experimentId=2", f"experimentId={experiment}"), "--pipe"])}
+
+        machines = [machine("current", 3), machine("ended", 1), machine("still-running", 2),
+                    machine("unlisted", 0), machine("other-experiment", 1, experiment="7"),
+                    {"name": "ssh-box", "via": False, "target": "vps"}]
+        runs = [{"id": 3, "status": "Running"}, {"id": 2, "status": "Running"}, {"id": 1, "status": "Stopped"}]
+        stale = stale_machines(machines, aish.target_from(URL), runs, aish)
+        self.assertEqual([(item["machine"], item["status"]) for item in stale],
+                         [("ended", "Stopped"), ("unlisted", "不在最近的 run 列表中")])
+
     def test_name_collision_refuses_without_changes(self):
         connector = FakeConnector()
         connector.machines = [{"name": "occupied", "via": False, "target": "other"}]
@@ -171,12 +209,25 @@ class OnboardingTests(unittest.TestCase):
     def test_installer_shared_skill_and_idempotence(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            first = install_herdr_skill.install(home)
-            second = install_herdr_skill.install(home)
+            first = installer.install(home)
+            second = installer.install(home)
             self.assertEqual(first["runtime"], second["runtime"])
             self.assertEqual(Path(first["codex_skill"]).resolve(), Path(first["claude_skill"]).resolve())
             self.assertTrue(os.access(first["command"], os.X_OK))
             self.assertIn(" herdr ", Path(first["command"]).read_text())
+            self.assertTrue(os.access(first["aish"], os.X_OK))
+            self.assertNotIn(" herdr ", Path(first["aish"]).read_text())
+            self.assertTrue((Path(first["runtime"]) / "aish_doctor.py").is_file())
+
+    def test_installer_refuses_unrelated_aish_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            command = home / ".local/bin/aish"
+            command.parent.mkdir(parents=True)
+            command.write_text("keep")
+            with self.assertRaises(RuntimeError):
+                installer.install(home)
+            self.assertEqual(command.read_text(), "keep")
 
     def test_installer_refuses_unrelated_skill(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -185,7 +236,7 @@ class OnboardingTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("keep")
             with self.assertRaises(RuntimeError):
-                install_herdr_skill.install(home)
+                installer.install(home)
             self.assertEqual((skill / "SKILL.md").read_text(), "keep")
             self.assertFalse((home / ".local/share/aish/current").exists())
 

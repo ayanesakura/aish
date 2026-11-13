@@ -11,6 +11,8 @@
   aish runs gpu                         查看实验下最近的 run 和 pod
   aish gpu --exec 'nvidia-smi'          非交互执行，按远端退出码退出
   aish ls | aish rm gpu | aish login    列出 / 删除机器；从浏览器刷新 cookie
+  aish herdr gpu --latest               把实验下最新的运行中 pod 接入 Herdr（训练换了 run 之后）
+  aish doctor                           检查 cookie、保存的机器、Herdr 远端机器和 pod 环境
 
 也可直接给 URL：aish '<URL>' [--tmux NAME] [-- 命令...]（直接给 URL 时默认是普通 shell）。
 本地转义：行首 ~. 断开；~~ 发送 ~；~? 帮助。
@@ -44,7 +46,7 @@ DEFAULT_TOKEN_FILE = "~/.config/ais-webshell/ais_token"
 DEFAULT_HOSTS_FILE = "~/.config/ais-webshell/hosts.json"
 DEFAULT_TMUX_SESSION = "main"
 UA = "aish/2.0"
-SUBCOMMANDS = ("add", "ls", "rm", "runs", "login", "herdr", "help")
+SUBCOMMANDS = ("add", "ls", "rm", "runs", "login", "herdr", "doctor", "help")
 
 # 保活节奏照抄 terminal 页面的 heartCheck：setInterval(28000)，首次触发后再等 10s 发空帧，之后每 28s。
 HEARTBEAT_FIRST = 28.0 + 10.0
@@ -132,6 +134,29 @@ def write_private(path: str, text: str) -> None:
         f.write(text)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+AUTH_NOTIFY_INTERVAL = 600.0
+
+
+def notify_auth_failure() -> None:
+    """--pipe 由 Herdr 在后台拉起，stderr 没人看：平台拒绝请求（多半是登录失效）时发一条 macOS 通知。
+    Herdr 会反复重连，所以 AUTH_NOTIFY_INTERVAL 秒内最多发一条；AISH_NO_NOTIFY=1 关闭。"""
+    if sys.platform != "darwin" or os.environ.get("AISH_NO_NOTIFY"):
+        return
+    stamp = os.path.join(os.path.dirname(token_file_path()), "auth-notified")
+    try:
+        if time.time() - os.stat(stamp).st_mtime < AUTH_NOTIFY_INTERVAL:
+            return
+    except OSError:
+        pass
+    try:
+        write_private(stamp, "")
+        subprocess.run(["osascript", "-e", 'display notification "Herdr 连不上 pod：AI Studio 拒绝了请求，多半是登录已失效。'
+                        '请在浏览器重新登录，然后运行 aish login；仍不行就运行 aish doctor。" with title "aish"'],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 # 基于 Chromium 的浏览器：(显示名, Application Support 下的目录, 钥匙串条目)
@@ -1224,6 +1249,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="aish", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="AI Studio WebShell 终端客户端（效果类似 ssh -t）。",
         epilog="子命令：aish add <名字> <URL> [--tmux S|--no-tmux] [--pin] | aish ls | aish rm <名字> | aish runs <名字> | aish login\n"
+               "        aish herdr <名字或URL> [--latest] | aish doctor [名字]\n"
                "aish <目标> -- <命令...>  连上后自动输入该命令（普通 shell 模式）。\n"
                "交互模式下行首 ~. 断开连接。")
     p.add_argument("target", nargs="?", help="保存的机器名，或平台 web-shell 页面 URL")
@@ -1257,6 +1283,9 @@ def main(argv: list[str]) -> int:
         if sub == "herdr":
             from aish_herdr import connect
             return connect(rest, sys.modules[__name__])
+        if sub == "doctor":
+            from aish_doctor import doctor
+            return doctor(rest, sys.modules[__name__])
         return {"add": cmd_add, "ls": cmd_ls, "rm": cmd_rm, "runs": cmd_runs, "login": cmd_login}[sub](rest)
 
     initial: list[str] | None = None
@@ -1283,7 +1312,12 @@ def main(argv: list[str]) -> int:
 
     allow_browser = not (a.pipe is not None or a.no_browser_cookie or os.environ.get("AISH_NO_BROWSER_COOKIE"))
     jar = CookieJar(t.base, allow_browser)
-    jar.get()
+    try:
+        jar.get()
+    except AishError:
+        if a.pipe is not None:
+            notify_auth_failure()
+        raise
 
     in_fd, out_fd = sys.stdin.fileno(), sys.stdout.fileno()
     if a.exec_cmd is None and a.pipe is None and not os.isatty(in_fd):
@@ -1293,7 +1327,12 @@ def main(argv: list[str]) -> int:
     asyncio.set_event_loop(loop)
     try:
         if a.pipe is not None:
-            info, ws = loop.run_until_complete(connect_shell(t, jar, 200, 50))
+            try:
+                info, ws = loop.run_until_complete(connect_shell(t, jar, 200, 50))
+            except AishError as e:
+                if e.auth:
+                    notify_auth_failure()
+                raise
             return loop.run_until_complete(run_pipe(ws, a.pipe, a.timeout))
         if a.exec_cmd is not None:
             cols, rows = term_size(out_fd) if os.isatty(out_fd) else (200, 50)
