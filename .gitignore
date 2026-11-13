@@ -1,0 +1,5 @@
+dev/stty_before
+dev/stty_after
+dev/*.log
+__pycache__/
+.DS_Store

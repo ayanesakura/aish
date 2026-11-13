@@ -1,0 +1,724 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["websockets>=14"]
+# ///
+"""aish — 在本地终端里接入 AI Studio 训练 pod 的 WebShell（效果类似 ssh -t）。
+
+用法:
+  aish <web-shell 页面 URL> [选项]                 交互模式
+  aish <URL> -- <命令...>                          连上后自动输入该命令，之后仍是交互模式
+  aish <URL> --exec '<命令>' [--timeout 30]        非交互：执行命令、打印输出、按远端退出码退出
+  aish --project P --experiment E --run R --pod POD [--container main] ...
+
+本地退出键：行首输入 ~. 断开连接（同 ssh）；~~ 发送一个 ~；~? 显示帮助。
+凭据：读取 ~/.config/ais-webshell/ais_token（可用环境变量 AIS_TOKEN_FILE 覆盖）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import codecs
+import json
+import os
+import re
+import secrets
+import selectors
+import shlex
+import signal
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_BASE = "https://ais.mlp.shopee.io"
+DEFAULT_TOKEN_FILE = "~/.config/ais-webshell/ais_token"
+UA = "aish/1.0"
+
+# 保活节奏照抄 terminal 页面的 heartCheck：setInterval(28000)，首次触发后再等 10s 发空帧，
+# 之后每 28s 发一次 ws.send("")。
+HEARTBEAT_FIRST = 28.0 + 10.0
+HEARTBEAT_INTERVAL = 28.0
+# 页面在 onopen 后 2s 才调 opsresize；我们在收到首个输出或 2s 后（取先到者）同步一次。
+INITIAL_RESIZE_DELAY = 2.0
+
+
+# --------------------------------------------------------------------------- 打码
+
+class Redactor:
+    JWT_RE = re.compile(r"ey" r"J[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*")
+    TOKEN_PARAM_RE = re.compile(r"((?:^|[?&])(?:token|pamtoken|authorization)=)[^&\s\"']*", re.I)
+    COOKIE_RE = re.compile(r"(ais_token=)[^;\s\"']*", re.I)
+
+    def __init__(self) -> None:
+        self.secrets: set[str] = set()
+
+    def add(self, s: str | None) -> None:
+        if s and len(s) >= 6:
+            self.secrets.add(s)
+            self.secrets.add(urllib.parse.quote(s, safe=""))
+
+    def __call__(self, s: object) -> str:
+        s = str(s)
+        for sec in sorted(self.secrets, key=len, reverse=True):
+            s = s.replace(sec, "<redacted>")
+        s = self.JWT_RE.sub("<jwt-redacted>", s)
+        s = self.TOKEN_PARAM_RE.sub(r"\1<redacted>", s)
+        s = self.COOKIE_RE.sub(r"\1<redacted>", s)
+        return s
+
+
+REDACT = Redactor()
+VERBOSE = False
+
+
+class AishError(Exception):
+    def __init__(self, msg: str, code: int = 2) -> None:
+        super().__init__(msg)
+        self.code = code
+
+
+def log(msg: str) -> None:
+    """调试输出（-v）。raw 模式下用 \\r\\n 换行。"""
+    if VERBOSE:
+        sys.stderr.write("[aish] " + REDACT(msg) + "\r\n")
+        sys.stderr.flush()
+
+
+def note(msg: str) -> None:
+    sys.stderr.write("[aish] " + REDACT(msg) + "\r\n")
+    sys.stderr.flush()
+
+
+# --------------------------------------------------------------------------- 凭据 / 参数
+
+def token_file_path() -> str:
+    return os.path.expanduser(os.environ.get("AIS_TOKEN_FILE") or DEFAULT_TOKEN_FILE)
+
+
+RELOGIN_HINT = "请在浏览器重新登录 AI Studio（{base}），从 Cookie 中复制 ais_token 的值，写入 {path}（只写值，chmod 600）。"
+
+
+def load_cookie(base: str) -> str:
+    path = token_file_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+    except FileNotFoundError:
+        raise AishError(f"找不到 cookie 文件：{path}。" + RELOGIN_HINT.format(base=base, path=path))
+    except OSError as e:
+        raise AishError(f"无法读取 cookie 文件 {path}：{e.strerror}")
+    if v.lower().startswith("ais_token="):
+        v = v.split("=", 1)[1].strip()
+    REDACT.add(v)
+    if not v or any(c in v for c in "\r\n; \t"):
+        raise AishError(f"cookie 文件 {path} 内容格式不对（应只有一行 ais_token 的值）。"
+                        + RELOGIN_HINT.format(base=base, path=path))
+    return v
+
+
+class Target:
+    def __init__(self, base: str, project: str, experiment: str, run: str, pod: str, container: str):
+        self.base, self.project, self.experiment = base, project, experiment
+        self.run, self.pod, self.container = run, pod, container
+
+
+def parse_target(a: argparse.Namespace) -> Target:
+    vals = {"project": None, "experiment": None, "run": None, "pod": None, "container": None}
+    base = None
+    if a.url:
+        u = urllib.parse.urlsplit(a.url)
+        if u.scheme not in ("http", "https") or not u.netloc:
+            raise AishError("URL 无法解析，应形如 https://ais.mlp.shopee.io/projects/.../web-shell?...")
+        base = f"{u.scheme}://{u.netloc}"
+        q = urllib.parse.parse_qs(u.query)
+        keymap = {"projectId": "project", "experimentId": "experiment", "runId": "run",
+                  "podName": "pod", "containerName": "container", "instance": "pod", "container": "container"}
+        for k, dst in keymap.items():
+            if q.get(k) and not vals[dst]:
+                vals[dst] = q[k][0]
+    for k in vals:
+        v = getattr(a, k)
+        if v:
+            vals[k] = v
+    if not vals["container"]:
+        vals["container"] = "main"
+    missing = [k for k, v in vals.items() if not v]
+    if missing:
+        raise AishError("缺少参数：" + ", ".join("--" + m for m in missing)
+                        + "（可以直接给 web-shell 页面 URL）")
+    base = (os.environ.get("AIS_BASE_URL") or base or DEFAULT_BASE).rstrip("/")
+    return Target(base, **vals)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- HTTP
+
+def http_get(url: str, cookie: str, timeout: float = 15.0) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, headers={
+        "Cookie": f"ais_token={cookie}", "Accept": "application/json, */*", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, body
+    except urllib.error.URLError as e:
+        raise AishError(f"网络错误：{e.reason}")
+    except (TimeoutError, OSError) as e:
+        raise AishError(f"网络错误：{e}")
+
+
+class ShellInfo:
+    def __init__(self, term_url: str):
+        self.term_url = term_url
+        u = urllib.parse.urlsplit(term_url)
+        q = urllib.parse.parse_qs(u.query)
+        self.origin = f"{u.scheme}://{u.netloc}"
+        self.session = (q.get("session") or [""])[0]
+        self.cluster = (q.get("cluster") or [""])[0]
+        self.token = (q.get("token") or [""])[0]
+        REDACT.add(self.token)
+        if not self.session:
+            raise AishError("换到的 webshell 地址里没有 session 参数，协议可能已变化。")
+
+    def ws_url(self, cols: int, rows: int) -> str:
+        u = urllib.parse.urlsplit(self.term_url)
+        scheme = {"https": "wss", "http": "ws"}.get(u.scheme)
+        if not scheme or not u.path.endswith("/webshell/terminal"):
+            raise AishError("换到的 webshell 地址格式不认识，协议可能已变化。")
+        path = u.path[: -len("/webshell/terminal")] + "/webshell/opsws"
+        query = u.query + f"&cols={cols}&rows={rows}"  # 查询串原样保留
+        return urllib.parse.urlunsplit((scheme, u.netloc, path, query, ""))
+
+    def token_exp(self) -> float | None:
+        try:
+            seg = self.token.split(".")[1]
+            seg += "=" * (-len(seg) % 4)
+            exp = json.loads(base64.urlsafe_b64decode(seg)).get("exp")
+            return float(exp) if exp else None
+        except Exception:
+            return None
+
+
+def fetch_shell(t: Target, cookie: str) -> ShellInfo:
+    q = urllib.parse.urlencode({"instance": t.pod, "container": t.container, "ch": "ais-web"})
+    p = lambda s: urllib.parse.quote(s, safe="")
+    url = (f"{t.base}/api/experiment/v1/projects/{p(t.project)}/experiments/{p(t.experiment)}"
+           f"/runs/{p(t.run)}/webshellUrl?{q}")
+    status, body = http_get(url, cookie)
+    path = token_file_path()
+    try:
+        j = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        j = None
+    if status != 200 or not isinstance(j, dict) or j.get("code") != 200:
+        code = j.get("code") if isinstance(j, dict) else None
+        msg = (j.get("msg") if isinstance(j, dict) else None) or ""
+        detail = f"HTTP {status}" + (f"，code={code}" if code is not None else "") \
+            + (f"，msg={str(msg)[:200]}" if msg else "") + ("" if isinstance(j, dict) else "，返回的不是 JSON")
+        raise AishError(f"换取 WebShell 令牌失败（{detail}）。cookie 可能已失效或无权访问该 pod。"
+                        + RELOGIN_HINT.format(base=t.base, path=path))
+    try:
+        term_url = j["data"]["url"]
+    except (KeyError, TypeError):
+        raise AishError("换令牌返回里没有 data.url，协议可能已变化。")
+    info = ShellInfo(term_url)
+    log(f"terminal url: {term_url}")
+    exp = info.token_exp()
+    if exp:
+        log(f"session={info.session} token 过期时间 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exp))}"
+            f"（约 {int((exp - time.time()) / 60)} 分钟后）")
+    return info
+
+
+def do_resize(info: ShellInfo, cookie: str, cols: int, rows: int) -> None:
+    q = urllib.parse.urlencode({"cols": cols, "rows": rows, "session": info.session, "cluster": info.cluster})
+    status, body = http_get(f"{info.origin}/api/webshell/v1/webshell/opsresize?{q}", cookie, timeout=10)
+    log(f"opsresize {cols}x{rows} -> HTTP {status} {body[:120].decode('utf-8', 'replace')}")
+
+
+# --------------------------------------------------------------------------- WebSocket
+
+async def open_ws(info: ShellInfo, cookie: str, cols: int, rows: int):
+    from websockets.asyncio.client import connect
+    from websockets.exceptions import InvalidHandshake, InvalidStatus
+
+    url = info.ws_url(cols, rows)
+    log(f"connect {url}")
+    try:
+        return await connect(url, additional_headers={"Cookie": f"ais_token={cookie}"},
+                             user_agent_header=UA, max_size=None, ping_interval=None,
+                             open_timeout=20, close_timeout=3)
+    except InvalidStatus as e:
+        st = e.response.status_code
+        hint = (" cookie 可能已失效。" + RELOGIN_HINT.format(base=info.origin, path=token_file_path())) \
+            if st in (401, 403) else ""
+        raise AishError(f"WebSocket 握手失败：HTTP {st}。{hint}")
+    except (OSError, InvalidHandshake, asyncio.TimeoutError) as e:
+        raise AishError(f"WebSocket 连接失败：{type(e).__name__}: {e}")
+
+
+def close_desc(ws) -> tuple[int | None, str]:
+    code = getattr(ws, "close_code", None)
+    reason = getattr(ws, "close_reason", None) or ""
+    return code, reason
+
+
+async def heartbeat(ws) -> None:
+    from websockets.exceptions import ConnectionClosed
+    try:
+        await asyncio.sleep(HEARTBEAT_FIRST)
+        while True:
+            await ws.send("")
+            log("heartbeat")
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+    except ConnectionClosed:
+        pass
+
+
+def as_bytes(m: str | bytes) -> bytes:
+    return m if isinstance(m, bytes) else m.encode("utf-8")
+
+
+def write_all(fd: int, data: bytes) -> None:
+    mv = memoryview(data)
+    while mv:
+        try:
+            n = os.write(fd, mv)
+        except BlockingIOError:
+            time.sleep(0.005)
+            continue
+        mv = mv[n:]
+
+
+# --------------------------------------------------------------------------- 交互模式
+
+class EscapeFilter:
+    """行首 ~ 转义：~. 断开，~~ 发送 ~，~? 帮助，其它原样发送。"""
+
+    def __init__(self) -> None:
+        self.at_bol = True
+        self.pending = False
+
+    def feed(self, data: bytes) -> tuple[bytes, str | None]:
+        out = bytearray()
+        for b in data:
+            if self.pending:
+                self.pending = False
+                if b == ord("."):
+                    return bytes(out), "disconnect"
+                if b == ord("~"):
+                    out.append(b)
+                    self.at_bol = False
+                    continue
+                if b == ord("?"):
+                    note("转义序列：~. 断开连接   ~~ 发送 ~   ~? 本帮助（仅在行首有效）")
+                    continue
+                out.append(ord("~"))
+            if self.at_bol and b == ord("~"):
+                self.pending = True
+                continue
+            out.append(b)
+            self.at_bol = b in (13, 10)
+        return bytes(out), None
+
+
+ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b[()][0-9A-Za-z]|\x1b[=>]")
+
+
+class ExitWatcher:
+    """实测：远端 shell 退出后网关不会关闭 WebSocket（之后再发输入也不会）。
+    这里识别「用户在行内输入 exit/logout（或空行 ^D）回车，随后输出以 shell 打印的
+    exit/logout 结尾，且 QUIET 秒内没有新输出（即没有出现新的提示符）」，判定远端 shell 已退出。
+    嵌套 shell / tmux 里 exit 后会出现外层提示符，因而不会误判。"""
+
+    QUIET = 1.5
+
+    def __init__(self) -> None:
+        self.line = bytearray()
+        self.dirty = False      # 本行出现过方向键/Tab 等，内容不可信
+        self.armed_at: float | None = None
+        self.out = bytearray()
+
+    def _arm(self, cond: bool) -> None:
+        self.armed_at = time.monotonic() if cond else None
+        self.out.clear()
+
+    def on_input(self, data: bytes) -> None:
+        self.armed_at = None    # 任何新输入都取消待判定状态
+        for b in data:
+            if b in (13, 10):
+                cmd = self.line.decode("utf-8", "replace").strip()
+                self._arm(not self.dirty and re.fullmatch(r"(exit|logout)(\s+\d+)?", cmd) is not None)
+                self.line.clear()
+                self.dirty = False
+            elif b == 4:
+                self._arm(not self.line and not self.dirty)
+            elif b in (8, 127):
+                if self.line:
+                    del self.line[-1]
+            elif b in (3, 21):
+                self.line.clear()
+                self.dirty = False
+            elif b < 32:
+                self.dirty = True
+            else:
+                self.line.append(b)
+
+    def on_output(self, data: bytes) -> None:
+        if self.armed_at is not None:
+            self.out += data
+            if len(self.out) > 4096:
+                del self.out[:-4096]
+
+    def shell_gone(self, last_output: float) -> bool:
+        if self.armed_at is None:
+            return False
+        now = time.monotonic()
+        if now - self.armed_at < self.QUIET or now - last_output < self.QUIET:
+            return False
+        tail = ANSI_RE.sub(b"", bytes(self.out)).strip()
+        return tail.endswith(b"exit") or tail.endswith(b"logout")
+
+
+def term_size(fd: int) -> tuple[int, int]:
+    try:
+        s = os.get_terminal_size(fd)
+        if s.columns > 0 and s.lines > 0:
+            return s.columns, s.lines
+    except OSError:
+        pass
+    return 80, 24
+
+
+async def interactive(info: ShellInfo, cookie: str, initial_cmd: str | None, in_fd: int, out_fd: int) -> int:
+    import termios
+    import tty
+    from websockets.exceptions import ConnectionClosed
+
+    loop = asyncio.get_running_loop()
+    cols, rows = term_size(out_fd if os.isatty(out_fd) else in_fd)
+    ws = await open_ws(info, cookie, cols, rows)
+
+    stop: asyncio.Future = loop.create_future()
+
+    def finish(reason: str, code: int) -> None:
+        if not stop.done():
+            stop.set_result((reason, code))
+
+    first_output = asyncio.Event()
+    winch = asyncio.Event()
+    sendq: asyncio.Queue = asyncio.Queue()
+    esc = EscapeFilter()
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+    watcher = ExitWatcher()
+    last_output = [time.monotonic()]
+
+    async def reader() -> None:
+        try:
+            async for m in ws:
+                if m:
+                    b = as_bytes(m)
+                    write_all(out_fd, b)
+                    last_output[0] = time.monotonic()
+                    watcher.on_output(b)
+                    first_output.set()
+        except ConnectionClosed:
+            pass
+        code, reason = close_desc(ws)
+        log(f"server closed: code={code} reason={reason!r}")
+        if code == 1000:
+            finish("连接已关闭（远端会话结束）", 0)
+        else:
+            finish(f"连接意外断开（close code={code}{', ' + reason if reason else ''}）", 1)
+
+    async def sender() -> None:
+        try:
+            while True:
+                s = await sendq.get()
+                await ws.send(s)
+        except ConnectionClosed:
+            pass
+
+    def on_stdin() -> None:
+        try:
+            data = os.read(in_fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as e:
+            finish(f"读取本地输入失败：{e}", 1)
+            return
+        if not data:
+            finish("本地输入已结束（EOF）", 1)
+            return
+        data, action = esc.feed(data)
+        if data:
+            watcher.on_input(data)
+            s = dec.decode(data)
+            if s:
+                sendq.put_nowait(s)
+        if action == "disconnect":
+            finish("已断开（~.）", 0)
+
+    async def resizer() -> None:
+        try:
+            await asyncio.wait_for(first_output.wait(), INITIAL_RESIZE_DELAY)
+        except asyncio.TimeoutError:
+            pass
+        last = None
+        while True:
+            c, r = term_size(out_fd if os.isatty(out_fd) else in_fd)
+            if (c, r) != last:
+                try:
+                    await asyncio.to_thread(do_resize, info, cookie, c, r)
+                    last = (c, r)
+                except AishError as e:
+                    log(f"opsresize 失败：{e}")
+            await winch.wait()
+            winch.clear()
+            await asyncio.sleep(0.05)  # 合并连续的 SIGWINCH
+
+    async def exit_watch() -> None:
+        while True:
+            await asyncio.sleep(0.25)
+            if watcher.shell_gone(last_output[0]):
+                finish("远端 shell 已退出", 0)
+                return
+
+    async def typer() -> None:
+        try:
+            await asyncio.wait_for(first_output.wait(), 5.0)
+        except asyncio.TimeoutError:
+            pass
+        await asyncio.sleep(0.2)
+        sendq.put_nowait(initial_cmd + "\r")
+
+    old_attr = termios.tcgetattr(in_fd)
+    tasks: list[asyncio.Task] = []
+    sigs = [signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT]
+    try:
+        tty.setraw(in_fd, termios.TCSANOW)
+        loop.add_signal_handler(signal.SIGWINCH, winch.set)
+        for s in sigs:
+            loop.add_signal_handler(s, finish, f"收到信号 {signal.Signals(s).name}", 128 + int(s))
+        loop.add_reader(in_fd, on_stdin)
+        tasks = [asyncio.create_task(c) for c in (reader(), sender(), heartbeat(ws), resizer(), exit_watch())]
+        if initial_cmd:
+            tasks.append(asyncio.create_task(typer()))
+        reason, code = await stop
+    finally:
+        loop.remove_reader(in_fd)
+        for s in sigs + [signal.SIGWINCH]:
+            loop.remove_signal_handler(s)
+        termios.tcsetattr(in_fd, termios.TCSADRAIN, old_attr)
+        for t in tasks:
+            t.cancel()
+        try:
+            await asyncio.wait_for(ws.close(), 3)
+        except Exception:
+            pass
+    sys.stderr.write("\r\n")
+    note(reason)
+    return code
+
+
+# --------------------------------------------------------------------------- 非交互 --exec
+
+async def run_exec(info: ShellInfo, cookie: str, cmd: str, timeout: float) -> int:
+    from websockets.exceptions import ConnectionClosed
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    if sys.stdout.isatty():
+        cols, rows = term_size(sys.stdout.fileno())
+    else:
+        cols, rows = 200, 50
+    ws = await open_ws(info, cookie, cols, rows)
+
+    buf = bytearray()
+    got = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def reader() -> None:
+        try:
+            async for m in ws:
+                buf.extend(as_bytes(m))
+                got.set()
+        except ConnectionClosed:
+            pass
+        finally:
+            closed.set()
+            got.set()
+
+    async def wait_until(pred, until: float) -> bool:
+        """等到 pred() 为真返回 True；连接关闭返回 False；超时抛 TimeoutError。"""
+        while True:
+            got.clear()
+            if pred():
+                return True
+            if closed.is_set():
+                return False
+            rem = until - loop.time()
+            if rem <= 0:
+                raise TimeoutError
+            try:
+                await asyncio.wait_for(got.wait(), rem)
+            except asyncio.TimeoutError:
+                raise TimeoutError from None
+
+    tag = secrets.token_hex(6)
+    begin_re = re.compile(rb"__AISH_B_" + tag.encode() + rb"__\r?\n")
+    end_re = re.compile(rb"__AISH_E_" + tag.encode() + rb"_(\d+)__")
+    # 标记由 printf 拼出来，回显的命令行里不会出现完整标记字符串；用 eval 包住命令，
+    # 这样命令里含 ; & 换行 都没问题，$? 即命令的退出码。
+    line = (f"printf '__AISH_%s_%s__\\n' B {tag}; eval {shlex.quote(cmd)}; "
+            f"printf '__AISH_%s_%s_%d__\\n' E {tag} $?\r")
+
+    rt = asyncio.create_task(reader())
+    hb = asyncio.create_task(heartbeat(ws))
+    rc: int
+    out = b""
+    try:
+        # 等提示符出现（首个输出且安静 0.3s），再输入命令；等不到也照发（tty 会缓冲）。
+        try:
+            await wait_until(lambda: len(buf) > 0, min(deadline, loop.time() + 5))
+            while True:
+                n = len(buf)
+                await asyncio.sleep(0.3)
+                if len(buf) == n or closed.is_set():
+                    break
+        except TimeoutError:
+            pass
+        if closed.is_set():
+            raise AishError(f"远端在执行命令前关闭了连接（close code={close_desc(ws)[0]}）。", 255)
+        await ws.send(line)
+
+        mb: list = [None]
+        me: list = [None]
+
+        def done() -> bool:
+            if mb[0] is None:
+                mb[0] = begin_re.search(buf)
+            if mb[0] is not None:
+                me[0] = end_re.search(buf, mb[0].end())
+            return me[0] is not None
+
+        try:
+            ok = await wait_until(done, deadline)
+        except TimeoutError:
+            ok = None
+        start = mb[0].end() if mb[0] is not None else None
+        if ok:
+            out = bytes(buf[start:me[0].start()])
+            rc = int(me[0].group(1))
+        else:
+            out = bytes(buf[start:]) if start is not None else b""
+            if ok is None:
+                note(f"命令在 {timeout:g}s 内没有结束（--timeout），发送 Ctrl-C 后退出远端 shell。")
+                try:
+                    await ws.send("\x03")
+                    await asyncio.sleep(0.3)
+                except ConnectionClosed:
+                    pass
+                rc = 124
+            else:
+                note(f"远端连接在命令结束前关闭（close code={close_desc(ws)[0]}）。")
+                rc = 255
+        sys.stdout.buffer.write(out.replace(b"\r\n", b"\n"))
+        sys.stdout.buffer.flush()
+        # 让远端 shell 退出，不留游离 shell。
+        if not closed.is_set():
+            mark, t_exit = len(buf), loop.time()
+            # 实测：远端 shell 退出后网关并不关闭 WebSocket。bash 退出时会自己打印一行 exit
+            # （加上回显共两次），看到它即可认为 shell 已退出；非 bash 则最多等 3s。
+            gone = False
+            try:
+                await ws.send("exit\r")
+                gone = await wait_until(lambda: bytes(buf[mark:]).count(b"exit") >= 2,
+                                        loop.time() + 3)
+            except (ConnectionClosed, TimeoutError):
+                pass
+            log(f"exit 后 {loop.time() - t_exit:.2f}s，shell 已退出={gone}，服务端已关闭={closed.is_set()}，"
+                f"尾部输出={bytes(buf[mark:])[-160:]!r}")
+        code, reason = close_desc(ws)
+        log(f"close code={code} reason={reason!r}")
+        return rc
+    finally:
+        hb.cancel()
+        try:
+            await asyncio.wait_for(ws.close(), 3)
+        except Exception:
+            pass
+        rt.cancel()
+
+
+# --------------------------------------------------------------------------- main
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="aish", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="AI Studio WebShell 终端客户端（效果类似 ssh -t）。",
+        epilog="aish <URL> -- <命令...>  连上后自动输入该命令，之后仍为交互模式。\n"
+               "交互模式下行首 ~. 断开连接。凭据文件：$AIS_TOKEN_FILE 或 " + DEFAULT_TOKEN_FILE)
+    p.add_argument("url", nargs="?", help="平台 web-shell 页面 URL")
+    p.add_argument("--project", help="projectId")
+    p.add_argument("--experiment", help="experimentId")
+    p.add_argument("--run", help="runId")
+    p.add_argument("--pod", help="podName")
+    p.add_argument("--container", help="containerName（默认 main）")
+    p.add_argument("--exec", dest="exec_cmd", metavar="CMD", help="非交互执行命令并按远端退出码退出")
+    p.add_argument("--timeout", type=float, default=30.0, help="--exec 超时秒数（默认 30）")
+    p.add_argument("-v", "--verbose", action="store_true", help="调试输出（URL 中的 token 会打码）")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    global VERBOSE
+    initial: list[str] | None = None
+    if "--" in argv:
+        i = argv.index("--")
+        argv, initial = argv[:i], argv[i + 1:]
+    a = build_parser().parse_args(argv)
+    VERBOSE = a.verbose
+    if initial is not None and a.exec_cmd is not None:
+        raise AishError("--exec 和 -- <命令> 不能同时使用。")
+    if initial is not None and not initial:
+        raise AishError("-- 后面需要命令。")
+
+    t = parse_target(a)
+    cookie = load_cookie(t.base)
+
+    in_fd, out_fd = sys.stdin.fileno(), sys.stdout.fileno()
+    if a.exec_cmd is None and not os.isatty(in_fd):
+        raise AishError("stdin 不是终端，无法进入交互模式；非交互请用 --exec '<命令>'。")
+
+    info = fetch_shell(t, cookie)
+    loop = asyncio.SelectorEventLoop(selectors.SelectSelector())  # select() 对 tty 最可靠
+    asyncio.set_event_loop(loop)
+    try:
+        if a.exec_cmd is not None:
+            return loop.run_until_complete(run_exec(info, cookie, a.exec_cmd, a.timeout))
+        cmd = " ".join(initial) if initial else None
+        return loop.run_until_complete(interactive(info, cookie, cmd, in_fd, out_fd))
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except AishError as e:
+        sys.stderr.write("aish: " + REDACT(e) + "\n")
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.stderr.write("aish: 已中断\n")
+        sys.exit(130)
+    except Exception as e:  # 兜底：不打 traceback，避免把 URL/凭据带出来
+        sys.stderr.write(f"aish: 内部错误 {type(e).__name__}: {REDACT(e)}（加 -v 也不会打印凭据）\n")
+        sys.exit(1)
