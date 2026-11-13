@@ -29,6 +29,19 @@ aish gpu
 - 在另一台电脑或另一个终端运行 `aish gpu`：会接管这个会话，旧的客户端自动退出。
 - 在 tmux 里 `exit` 掉最后一个 shell：tmux 会话结束，aish 随之退出。
 
+### aish 给 tmux 设置的默认选项
+如果你在 pod 上没有自己的 `~/.tmux.conf`，每次 `aish gpu` 接入时 aish 会设置这些选项（有自己的配置就完全不动，以你的为准；设置 `AISH_TMUX_DEFAULTS=0` 也可以关掉）：
+| 选项 | 效果 |
+|---|---|
+| `mouse on` | **滚轮直接翻看历史输出**（进入复制模式，按 `q` 退出），可以用鼠标点选 pane 和拖动分隔线；拖选文字会复制到 tmux，并经 OSC 52 写入 mac 剪贴板 |
+| `history-limit 100000` | 每个窗口保留 10 万行历史 |
+| `escape-time 10` | tmux 3.4 默认 500ms，会让你在 Claude 里按 Esc 中断时卡一下 |
+| `default-terminal tmux-256color`；本地支持真彩色时再加 RGB 和 `COLORTERM=truecolor` | Claude 的配色完整显示 |
+| 新窗口用 `bash --norc`，并恢复平台的 `PS1` | 和网页 WebShell 一致，带 pod 名的提示符 |
+
+- 想用终端自带的选择（不经过 tmux）：Ghostty / iTerm2 里**按住 Shift 拖选**。
+- 鼠标、Esc 这类选项接入时立即生效；历史行数和提示符只对**新开的窗口**（`Ctrl-b c`）生效，已有窗口保持原样。
+
 其他用法：
 ```bash
 aish gpu --exec 'nvidia-smi'       # 非交互：打印输出，按远端退出码退出（--timeout 默认 30s，超时退出码 124）
@@ -57,6 +70,7 @@ aish login                         # 手动从 Chrome 刷新 cookie
 
 ## 注意 / 已知局限
 - **不用 tmux 时，断开 ≠ 退出**：网关在断开时不回收远端 shell，远端 shell 退出时也不会关闭连接。普通 shell 模式下请用 `exit` 退出；aish 能识别出 `exit`/`logout`/^D 并自动结束。tmux 模式下没有这个问题：tmux 客户端结束后，aish 会让它所在的 shell 也退出。
+- OSC 52 剪贴板依赖本地终端支持（Ghostty、iTerm2 支持），没有逐一实测。
 - tmux 模式用 `tmux -u new-session -A -D -s <名字>`：`-D` 会踢掉同一会话上的其他客户端，包括你在浏览器 WebShell 里 attach 的。终端类型会优先用 `xterm-256color`。
 - token 约 1 小时过期：断线重连时会重新换令牌。已经建立的连接在 token 过期后还能不能继续用，**没有实测**（页面脚本里也没有任何刷新逻辑）。
 - `--exec` 用 `eval` 包住命令，用随机结束标记判断命令何时结束；命令如果自己执行 `exit`，会得到退出码 255。
@@ -70,5 +84,7 @@ printf 'mockcookie123456' > /tmp/mock_cookie
 export AIS_BASE_URL=http://127.0.0.1:18765 AIS_TOKEN_FILE=/tmp/mock_cookie AISH_HOSTS_FILE=/tmp/hosts.json AISH_NO_BROWSER_COOKIE=1
 ./aish add mk 'https://x/y?containerName=main&experimentId=1&podName=p&projectId=2&runId=3' --tmux aishmock
 python3 dev/tmux_test.py ./aish mk --drop          # tmux：接入/断线重连/窗口/detach/接回/接管/结束
+python3 dev/tmux_opts_test.py 'mock$' -- ./aish mk  # tmux 默认选项、提示符、滚轮进入复制模式
+# 在真实 pod 上测试时，用 AISH_TMUX_SOCKET=aish-test 走独立的 tmux socket，不影响正在用的会话
 python3 dev/pty_test.py full x -- ./aish 'https://x/y?containerName=main&experimentId=1&podName=p&projectId=2&runId=3'   # 普通 shell
 ```

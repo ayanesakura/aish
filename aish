@@ -631,15 +631,45 @@ ALT_ENTER = b"\x1b[?1049h"
 NOTMUX_RE = re.compile(rb"__AISH_NOTMUX__\r?\n")
 
 
+def tmux_defaults() -> list[str]:
+    """aish 接入时给 tmux 设置的默认选项（用户有自己的 tmux.conf 时不设置）。
+    都带 -q：老版本 tmux 不认识的选项静默跳过，不会让整条命令失败。"""
+    opts = [
+        "set -gq mouse on",                         # 滚轮翻历史、拖选复制（经 OSC 52 进本地剪贴板）
+        "set -gq history-limit 100000",
+        "set -sq escape-time 10",                   # 3.4 默认 500ms，会让 Claude 里按 Esc 卡一下
+        "set -gq default-terminal $D",              # tmux-256color（没有则 screen-256color）
+        # 和网页 WebShell 一致用 bash --norc，并保留平台导出的 PS1（带 pod 名）。tmux 经 `$SHELL -c` 启动
+        # default-command，而非交互 bash 会去掉 PS1，所以先把它另存为 AISH_PS1 再恢复。
+        'setenv -g AISH_PS1 "$PS1"',
+        """set -gq default-command '[ -n "$AISH_PS1" ] && export PS1="$AISH_PS1"; exec bash --norc'""",
+    ]
+    if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit"):  # 本地终端支持真彩色
+        opts += ["set -sq 'terminal-features[90]' 'xterm-256color:RGB'", "setenv -g COLORTERM truecolor"]
+    return opts
+
+
 def tmux_attach_line(session: str) -> str:
     """输入到远端 shell 的一行：接入（或新建）tmux 会话。
     -A 已存在就接入；-D 踢掉其它（如上次断线残留的）客户端；-u 强制 UTF-8。
+    选项放在 new-session 之前设置，新建会话的第一个窗口也能生效；接入已有会话时同样会更新选项。
     tmux 正常结束（detach / 被踢 / 会话结束）后 `&& exit` 让这个 shell 也退出，不留游离 shell；
-    tmux 启动失败则留在 shell 里，能看到报错。行首空格：不进 bash 历史（HISTCONTROL=ignorespace 时）。"""
+    tmux 启动失败则留在 shell 里，能看到报错。行首空格：不进 bash 历史（HISTCONTROL=ignorespace 时）。
+    AISH_TMUX_SOCKET：使用独立的 tmux socket（tmux -L，测试用）；AISH_TMUX_DEFAULTS=0：不设置默认选项。"""
     s = shlex.quote(session)
+    sock = os.environ.get("AISH_TMUX_SOCKET")
+    tmux = "tmux -u" + (f" -L {shlex.quote(sock)}" if sock else "")
+    plain = f"TERM=$T {tmux} new-session -A -D -s {s}"
+    if os.environ.get("AISH_TMUX_DEFAULTS", "1") == "0":
+        run = plain
+    else:
+        chain = " \\; ".join(["start-server"] + tmux_defaults() + [f"new-session -A -D -s {s}"])
+        run = (f'if [ -e ~/.tmux.conf ] || [ -e "${{XDG_CONFIG_HOME:-$HOME/.config}}/tmux/tmux.conf" ]; '
+               f"then {plain}; else TERM=$T {tmux} {chain}; fi")
     return (" command -v tmux >/dev/null 2>&1 || printf '__AISH_%s__\\n' NOTMUX; "
             "T=xterm; infocmp xterm-256color >/dev/null 2>&1 && T=xterm-256color; "
-            f"TERM=$T tmux -u new-session -A -D -s {s} && exit\r")
+            "D=screen-256color; infocmp tmux-256color >/dev/null 2>&1 && D=tmux-256color; "
+            f"{run} && exit\r")
 
 
 def term_size(fd: int) -> tuple[int, int]:
