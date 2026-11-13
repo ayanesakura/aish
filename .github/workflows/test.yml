@@ -2,6 +2,7 @@ name: test
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -16,6 +17,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
       - run: dev/run_tests.sh
