@@ -69,7 +69,34 @@ aish login                         # 手动从 Chrome 刷新 cookie
 - 不想让它读浏览器：加 `--no-browser-cookie`，或者设置 `AISH_NO_BROWSER_COOKIE=1`。
 - cookie 和 token 不会出现在任何输出里（`-v` 调试输出也会打码）。
 
-## 配合 herdr
+## 一句话接入 Herdr（Claude Code / Codex 共用）
+
+安装一次全局命令和共享 skill：
+
+```sh
+python3 install_herdr_skill.py
+```
+
+之后在 Claude Code 或 Codex 中说：**把这个 pod 接入 Herdr：`<WebShell URL>`**。
+也可以在终端直接运行：
+
+```sh
+~/.local/bin/herdr-pod '<WebShell URL>'
+# 指定 pod 上的目录时：
+~/.local/bin/herdr-pod '<WebShell URL>' --folder /workspace/verl
+```
+
+脚本会固定当前 pod，自动注册原生远端机器、安装 Herdr Core、检查 Bash/Node、创建独立远端 space 并切换过去。同一 pod 和目录重复执行会复用 space；不同 pod 分别注册，不覆盖旧连接。新 space 优先接入 tmux `main`，没有它才启动已安装的 Claude。未安装 Claude 时打开远端 shell 并返回警告；不会自动改认证或安装 Claude/Node。
+
+默认目录按 `/workspace/verl`、`/workspace`、HOME 的存在顺序选择。现有 Herdr TOML 保留原有选项，仅补充缺失的 `shell`，改写前生成同目录备份。Node 仅将 nvm 已安装的默认版本链接到 PATH 中的 `~/.local/bin/node`，不覆盖已有文件。
+
+安装产物在 `~/.local/share/aish/releases/`，`current` 指向当前版本；旧版本保留，已注册机器的传输命令固定到具体版本。共享 skill 链接在 `~/.agents/skills/herdr-pod`（Codex）和 `~/.claude/skills/herdr-pod`（Claude Code）。若当前对话未发现新 skill，开启新会话；命令行入口安装后即可使用。更新后重跑安装命令即可；遇到非本工具已有文件会拒绝覆盖。
+
+需要本机已安装 `uv`、`hc`、`herdr-app`，Herdr 正在运行，浏览器已登录 AI Studio，pod 提供 Python 3 和 Bash。认证失效时先运行 `uv run --script ~/.local/share/aish/current/aish.py login`，再重试。结果 JSON 中的 `warnings` 表示剩余环境问题；原生绑定成功不代表 Claude 认证或模型 API 已验证。
+
+开发时可直接运行 `uv run --script aish.py herdr '<WebShell URL>'`，但长期使用请先安装，避免机器注册依赖临时开发目录。
+
+## 配合 herdr（手动方式）
 **要让 Herdr 的「+ → Claude Code」在 pod 上创建新会话，必须使用绑定远端 machine 的 space**，见下方「Herdr 原生远端机器」。仅在本机 space 的 pane 里运行 `aish gpu`，只能操作那个远端终端；该 space 的「+」仍会在 Mac 上新建程序。space 的名字不决定程序运行位置。
 
 ### 控制 pod 上已有的 Claude 会话

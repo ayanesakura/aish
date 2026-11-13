@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["websockets>=14", "cryptography>=42"]
+# dependencies = ["websockets>=14", "cryptography>=42", "tomlkit>=0.13"]
 # ///
 """aish — 在本地终端里接入 AI Studio 训练 pod 的 WebShell（效果类似 ssh -t / herdr --remote）。
 
@@ -44,7 +44,7 @@ DEFAULT_TOKEN_FILE = "~/.config/ais-webshell/ais_token"
 DEFAULT_HOSTS_FILE = "~/.config/ais-webshell/hosts.json"
 DEFAULT_TMUX_SESSION = "main"
 UA = "aish/2.0"
-SUBCOMMANDS = ("add", "ls", "rm", "runs", "login", "help")
+SUBCOMMANDS = ("add", "ls", "rm", "runs", "login", "herdr", "help")
 
 # 保活节奏照抄 terminal 页面的 heartCheck：setInterval(28000)，首次触发后再等 10s 发空帧，之后每 28s。
 HEARTBEAT_FIRST = 28.0 + 10.0
@@ -1254,6 +1254,9 @@ def main(argv: list[str]) -> int:
         if sub == "help":
             build_parser().print_help()
             return 0
+        if sub == "herdr":
+            from aish_herdr import connect
+            return connect(rest, sys.modules[__name__])
         return {"add": cmd_add, "ls": cmd_ls, "rm": cmd_rm, "runs": cmd_runs, "login": cmd_login}[sub](rest)
 
     initial: list[str] | None = None

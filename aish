@@ -1,2 +1,2 @@
 #!/bin/sh
-exec uv run --script "$(dirname "$0")/aish.py" "$@"
+exec uv run --quiet --script "$(dirname "$0")/aish.py" "$@"

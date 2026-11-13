@@ -63,7 +63,7 @@ class PipeTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def run_pipe(self, command, data=b"", timeout=20):
-        return subprocess.run(["uv", "run", "--script", str(ROOT / "aish.py"), TARGET,
+        return subprocess.run(["uv", "run", "--quiet", "--script", str(ROOT / "aish.py"), TARGET,
                                "--timeout", "5", "--pipe", command], env=self.env, input=data,
                               capture_output=True, timeout=timeout)
 

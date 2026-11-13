@@ -1,0 +1,4 @@
+interface:
+  display_name: "Herdr Pod"
+  short_description: "一句话把训练 pod 接入独立 Herdr 远端 space"
+  default_prompt: "使用 $herdr-pod 把这个 AI Studio WebShell URL 对应的 pod 接入 Herdr。"
