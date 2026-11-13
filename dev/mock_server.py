@@ -75,16 +75,19 @@ async def handler(ws):
         if os.environ.get("MOCK_HOME"):  # 测试「用户有自己的 ~/.tmux.conf」分支时用临时 HOME
             os.environ["HOME"] = os.environ["MOCK_HOME"]
         # 独立的 tmux socket 目录，和本机平时用的 tmux 隔离
-        os.environ["TMUX_TMPDIR"] = "/tmp/aish-mock-tmux"  # unix socket 路径有长度上限
+        os.environ.setdefault("TMUX_TMPDIR", "/tmp/aish-mock-tmux")
         os.environ["BASH_SILENCE_DEPRECATION_WARNING"] = "1"
         os.execv("/bin/bash", ["bash", "--norc", "--noprofile", "-i"])
     setsize(fd, int(q.get("cols", 80)), int(q.get("rows", 24)))
+    os.set_blocking(fd, False)
     SESSIONS[q.get("session")] = fd
     loop = asyncio.get_running_loop()
     outq = asyncio.Queue()
     def on_out():
         try:
             d = os.read(fd, 4096)
+        except BlockingIOError:
+            return
         except OSError:
             d = b""
         outq.put_nowait(d)
@@ -114,18 +117,40 @@ async def handler(ws):
                 hb += 1; LOG.write(f"heartbeat {hb}\n"); continue
             if os.environ.get("MOCK_LOG_INPUT"):
                 LOG.write(f"input {m!r}\n")
-            os.write(fd, m.encode() if isinstance(m, str) else m)
+            data = m.encode() if isinstance(m, str) else m
+            while data:
+                try:
+                    written = os.write(fd, data)
+                    data = data[written:]
+                except BlockingIOError:
+                    writable = loop.create_future()
+                    def ready():
+                        if not writable.done(): writable.set_result(None)
+                    loop.add_writer(fd, ready)
+                    try:
+                        await writable
+                    finally:
+                        loop.remove_writer(fd)
     t1 = asyncio.create_task(pump_out()); t2 = asyncio.create_task(pump_in())
     await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
     for t in (t1, t2): t.cancel()
+    await asyncio.gather(t1, t2, return_exceptions=True)
     try: loop.remove_reader(fd)
     except Exception: pass
     try: os.kill(pid, signal.SIGHUP)  # 本机 mock bash
     except ProcessLookupError: pass
     try: os.close(fd)
     except OSError: pass
-    try: os.waitpid(pid, 0)
-    except ChildProcessError: pass
+    reaped = asyncio.create_task(asyncio.to_thread(os.waitpid, pid, 0))
+    try:
+        await asyncio.wait_for(asyncio.shield(reaped), 2)
+    except asyncio.TimeoutError:
+        try: os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        await reaped
+    except ChildProcessError:
+        pass
+    SESSIONS.pop(q.get("session"), None)
     LOG.write(f"ws closed session={q.get('session')}\n")
 
 async def main():

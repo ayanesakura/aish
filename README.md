@@ -11,6 +11,7 @@ mac 和 pod 之间没有直连网络，aish 走的是平台网页 WebShell 背�
 
 ## 安装
 需要 [uv](https://docs.astral.sh/uv/)。依赖（websockets、cryptography）在第一次运行时自动安装。
+Python 入口是 `aish.py`，`aish` 只是调用它的两行 shell 启动器；`aish_pipe.py` 和 `aish_remote.py` 必须放在同一目录。也可始终使用 `uv run --script /绝对路径/aish.py`。
 ```bash
 git clone https://github.com/ayanesakura/aish.git ~/aish
 echo 'alias aish=~/aish/aish' >> ~/.zshrc && source ~/.zshrc
@@ -69,7 +70,58 @@ aish login                         # 手动从 Chrome 刷新 cookie
 - cookie 和 token 不会出现在任何输出里（`-v` 调试输出也会打码）。
 
 ## 配合 herdr
-在 herdr 的 pane 里运行 `aish gpu` 即可。pane 里显示的就是 pod 上的真实画面，herdr 合盖或 detach 时 aish 继续运行，断线也会自己接回。
+**要让 Herdr 的「+ → Claude Code」在 pod 上创建新会话，必须使用绑定远端 machine 的 space**，见下方「Herdr 原生远端机器」。仅在本机 space 的 pane 里运行 `aish gpu`，只能操作那个远端终端；该 space 的「+」仍会在 Mac 上新建程序。space 的名字不决定程序运行位置。
+
+### 控制 pod 上已有的 Claude 会话
+
+如果 Claude 已经在 tmux 的 `main` 会话中，在 Mac Herdr 的终端里运行：
+
+```bash
+uv run --script /绝对路径/aish.py gpu --run <runId> --pod <podName> --attach main --no-browser-cookie
+```
+
+`--attach` 只附着已有会话：不创建 tmux server 或会话、不修改 tmux 选项、不踢掉原客户端；断线后仍会自动附着同一会话。它要求固定 run/pod，避免训练重启后接到另一台机器。没有目标会话时会显示 tmux 错误，保留普通 shell，不创建新会话。
+
+此时 Herdr 中的键盘、粘贴、Esc、Ctrl-C 都传给 pod 上原来的 Claude。多个客户端共享输入和终端尺寸。用 `Ctrl-b d` 或行首 `~.` 离开，不会结束 Claude。普通 WebShell 中、没有 tmux 保护的既有 Claude 进程不能自动迁入此模式。
+
+这是 Herdr 中的远端终端画面。Claude 的结构化状态、聊天历史和会话列表不会因此自动成为 Herdr 原生远端会话。
+
+### Herdr 原生远端机器（需要 pod 上的 hc）
+
+`--pipe` 提供 `hc machine add --via` 要求的双向字节流：标准输入、标准输出、标准错误和退出码分别传输；不会把提示符、回显或连接信息混入 stdout。它通过明文 Python 源码启动管道代理，再用 base64 帧传递二进制数据，以适配平台只接受文本输入的 WebShell。pod 需要 `python3`。
+
+先用 `aish login` 在本地准备有效 cookie，然后注册固定 run/pod：
+
+```bash
+hc machine add --name training --via 'uv run --script /绝对路径/aish.py gpu --run <runId> --pod <podName> --pipe'
+```
+
+pod 缺少 `hc` 时，上述命令不会静默安装。确认允许在 pod 安装后，可在 `hc machine add` 后追加 `--install`。随后创建远端 space：
+
+```bash
+herdr-app do space.new '{"name":"Training pod","machine":"training","folder":"/workspace/verl"}'
+hc ls
+```
+
+在新 space 中启动的 Claude 由远端 Herdr Core 管理。安装 `hc` 不会接管已经运行在其他 WebShell 或 tmux 中的 Claude；继续使用旧会话请用前面的 `--attach`。
+
+在绑定远端机器的 space 中点顶部「+ → Claude Code」即可在 pod 新建 Claude；「+ → Terminal」也会在 pod 打开 shell。用 `herdr-app ls` 检查该 space 的 `machine` 是注册的机器名，终端地址应带 `training/` 前缀。只看 space 名称或某个 pane 的远端画面不足以确认这一点。
+
+已有 tmux 会话也可以放进同一个原生远端 space：通过 `tab.new` 的 `argv` 传入 `["tmux", "-u", "attach-session", "-t", "=main"]`。此时 tmux 客户端本身就在 pod，不再需要每个 pane 单独运行本地 aish。
+
+远端 Claude 的启动 hook 可能依赖 Node。注册后可用 `hc exec --on training 'command -v claude; command -v node'` 检查 Herdr 实际使用的 PATH。若 Node 只装在 nvm 内，应将已经安装且选中的 Node 暴露给这个环境；不要用 Mac 上是否存在 Node 来判断。
+
+如果「+ → Terminal」原样显示 `\[\033[32m\]`、`\w`，检查终端的实际 shell。平台导出的 `PS1` 使用 Bash 语法，而缺少 `SHELL` 的环境可能让 Herdr 启动 `/bin/sh`。在 **pod** 的 `~/.config/herdr-core/config.toml` 中设置 `shell = ["/bin/bash", "--norc"]`，新终端就会用 Bash 解释平台提示符。`remote/herdr-core.toml` 提供这一最小配置；已有配置时只合并 `shell` 项。当前空闲 shell 可运行 `exec /bin/bash --norc`，不需要重启 Claude 或 tmux。
+
+`--pipe` 不读取浏览器/钥匙串，也不自动重放命令；cookie 过期时先刷新 cookie，再由 Herdr 重连。`--timeout` 在管道模式下只限制各启动握手阶段，不限制会话总时长。连接结束会通知代理退出；网络丢失时代理在约 45 秒无心跳后清理自己启动的命令进程组。独立运行的 tmux/Herdr Core 服务不属于该进程组。
+
+本地验收：
+
+```bash
+python3 dev/pipe_test.py
+```
+
+测试覆盖全字节 1 MiB 往返、stderr/退出码、EOF、提前关闭 stdin、取消连接、拒绝自动跟随 run、两个客户端共享附着且保持 tmux 配置，以及真实 `hc machine add --via` / `hc exec -i` 接口。所有测试服务和 hc 配置均隔离；不连接生产 pod。没有安装 hc/tmux 时跳过对应集成测试。
 
 ## 本地转义键（行首有效）
 `~.` 断开（重连等待中按则放弃重连）· `~~` 发送一个 `~` · `~?` 帮助
