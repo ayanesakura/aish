@@ -6,6 +6,7 @@ mac 和 pod 之间没有直连网络，aish 走的是平台网页 WebShell 背�
 - **会话常驻**：默认接入 pod 上的 tmux 会话。关终端、断网、合盖都不影响 pod 上正在跑的东西（比如 Claude Code）。
 - **自动重连**：断线后自动重新换令牌，接回同一个 tmux 会话。会主动探测连接是否还活着（WebSocket ping），网络断开后约 25 秒内就能发现。
 - **按名字连接**：`aish add` 保存一次，以后只需要 `aish gpu`。
+- **自动跟随最新的 run**：训练重启或换了 run，pod 名会变，aish 每次连接都会自动找到实验下最新的运行中 run，连接同一角色的 pod（如 `master-0`）。
 - **cookie 自动获取**：直接读取本机 Chrome 里的 `ais_token`，过期了也会自动刷新。
 
 ## 安装
@@ -26,6 +27,9 @@ aish gpu
 # 3. 离开：Ctrl-b d（tmux detach）或行首 ~.，pod 上的会话继续运行
 ```
 - 断网或合盖后：aish 会提示「连接断开；N s 后重连」，然后自动接回。不想等的话，行首按 `~.` 放弃重连。
+- 训练换了 run：下次 `aish gpu`（或断线重连时）会提示「实验 … 最新的运行中 run 是 …，连接 pod …」，然后自动连到新 pod。新 pod 上是一个新的 tmux 会话，旧会话随旧 pod 一起结束。
+  - 实验下同时有多个 run 在运行时，连接最新创建的那个；要连其它的，用 `aish gpu --run <id>`。
+  - 不想跟随：保存时加 `--pin`（`aish add gpu '<URL>' --pin`），固定连这个 run/pod。
 - 在另一台电脑或另一个终端运行 `aish gpu`：会接管这个会话，旧的客户端自动退出。
 - 在 tmux 里 `exit` 掉最后一个 shell：tmux 会话结束，aish 随之退出。
 
@@ -49,6 +53,8 @@ aish gpu --tmux work               # 临时用另一个 tmux 会话名
 aish gpu --no-tmux                 # 普通 shell，不用 tmux（断线不会自动重连）
 aish gpu -- htop                   # 普通 shell，连上后自动输入命令
 aish ls / aish rm gpu              # 列出 / 删除保存的机器（~/.config/ais-webshell/hosts.json）
+aish runs gpu                      # 查看实验下最近的 run（状态、启动时间）和运行中 run 的 pod
+aish gpu --run 2459535             # 临时连接指定的 run（不跟随）
 aish add gpu2 '<URL>' --tmux cc    # 保存时指定 tmux 会话名；--no-tmux 表示保存为普通 shell
 aish '<URL>'                       # 不保存，直接用 URL（默认是普通 shell，加 --tmux NAME 用 tmux）
 aish login                         # 手动从 Chrome 刷新 cookie
@@ -82,7 +88,7 @@ aish login                         # 手动从 Chrome 刷新 cookie
 MOCK_KEEP_OPEN=1 dev/mock_server.py 18765 /tmp/mock.log &
 printf 'mockcookie123456' > /tmp/mock_cookie
 export AIS_BASE_URL=http://127.0.0.1:18765 AIS_TOKEN_FILE=/tmp/mock_cookie AISH_HOSTS_FILE=/tmp/hosts.json AISH_NO_BROWSER_COOKIE=1
-./aish add mk 'https://x/y?containerName=main&experimentId=1&podName=p&projectId=2&runId=3' --tmux aishmock
+./aish add mk 'https://x/y?containerName=main&experimentId=1&podName=p&projectId=2&runId=3' --tmux aishmock --pin
 python3 dev/tmux_test.py ./aish mk --drop          # tmux：接入/断线重连/窗口/detach/接回/接管/结束
 python3 dev/tmux_opts_test.py 'mock$' -- ./aish mk  # tmux 默认选项、提示符、滚轮进入复制模式
 # 在真实 pod 上测试时，用 AISH_TMUX_SOCKET=aish-test 走独立的 tmux socket，不影响正在用的会话

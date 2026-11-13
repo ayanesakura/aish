@@ -6,8 +6,9 @@
 """aish — 在本地终端里接入 AI Studio 训练 pod 的 WebShell（效果类似 ssh -t / herdr --remote）。
 
 常用:
-  aish add gpu '<web-shell 页面 URL>'   保存一台机器（默认接入 pod 上的 tmux 会话 main）
+  aish add gpu '<web-shell 页面 URL>'   保存一台机器（默认接入 tmux 会话 main，并跟随实验下最新的运行中 run）
   aish gpu                              接入；断线自动重连回同一个 tmux 会话
+  aish runs gpu                         查看实验下最近的 run 和 pod
   aish gpu --exec 'nvidia-smi'          非交互执行，按远端退出码退出
   aish ls | aish rm gpu | aish login    列出 / 删除机器；从浏览器刷新 cookie
 
@@ -41,7 +42,7 @@ DEFAULT_TOKEN_FILE = "~/.config/ais-webshell/ais_token"
 DEFAULT_HOSTS_FILE = "~/.config/ais-webshell/hosts.json"
 DEFAULT_TMUX_SESSION = "main"
 UA = "aish/2.0"
-SUBCOMMANDS = ("add", "ls", "rm", "login", "help")
+SUBCOMMANDS = ("add", "ls", "rm", "runs", "login", "help")
 
 # 保活节奏照抄 terminal 页面的 heartCheck：setInterval(28000)，首次触发后再等 10s 发空帧，之后每 28s。
 HEARTBEAT_FIRST = 28.0 + 10.0
@@ -295,10 +296,17 @@ class CookieJar:
 
 # =========================================================================== 目标 / 机器名
 
+POD_ROLE_RE = re.compile(r"-([A-Za-z]+-\d+)$")   # run-m7l2gpzv-2459805-master-0 -> master-0
+
+
 class Target:
     def __init__(self, base: str, project: str, experiment: str, run: str, pod: str, container: str):
         self.base, self.project, self.experiment = base, project, experiment
         self.run, self.pod, self.container = run, pod, container
+        m = POD_ROLE_RE.search(pod or "")
+        self.role = m.group(1) if m else None   # 跟随最新 run 时，选同一角色的 pod
+        self.follow = False                      # 每次连接前解析实验下最新的运行中 run
+        self.name: str | None = None             # 保存的机器名（跟随时记录最近一次的 run/pod）
 
 
 def target_from(url: str | None, overrides: dict | None = None) -> Target:
@@ -324,6 +332,23 @@ def target_from(url: str | None, overrides: dict | None = None) -> Target:
         raise AishError("缺少参数：" + ", ".join("--" + m for m in missing) + "（可以直接给 web-shell 页面 URL）")
     base = (os.environ.get("AIS_BASE_URL") or base or DEFAULT_BASE).rstrip("/")
     return Target(base, **vals)  # type: ignore[arg-type]
+
+
+def host_target(target: str | None, overrides: dict) -> tuple[Target, dict | None]:
+    """机器名或 URL → Target。保存的机器默认跟随实验下最新的运行中 run（--pin 保存的除外；
+    命令行显式给了 --run/--pod 也不跟随）。"""
+    if target and not target.startswith(("http://", "https://")):
+        hosts = load_hosts()
+        if target not in hosts:
+            raise AishError(f"未知的机器名 {target!r}（aish ls 查看，aish add 添加）")
+        h = hosts[target]
+        t = target_from(h.get("url"), overrides)
+        t.name = target
+        t.follow = bool(h.get("follow", True)) and not (overrides.get("run") or overrides.get("pod"))
+        if t.follow and h.get("last_run") and h.get("last_pod"):
+            t.run, t.pod = str(h["last_run"]), h["last_pod"]   # 上次连到的，用于判断 run 是否变化
+        return t, h
+    return target_from(target, overrides), None
 
 
 def hosts_path() -> str:
@@ -435,6 +460,83 @@ def fetch_shell(t: Target, jar: CookieJar) -> ShellInfo:
         raise
 
 
+def platform_api(t: Target, jar: CookieJar, path: str, params: dict | None = None):
+    """只读 GET 平台的 experiment 接口，返回 data。"""
+    def once():
+        q = ("?" + urllib.parse.urlencode(params)) if params else ""
+        status, body = http_get(f"{t.base}/api/experiment{path}{q}", jar.get())
+        try:
+            j = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            j = None
+        if status != 200 or not isinstance(j, dict) or j.get("code") != 200:
+            raise AishError(f"平台接口返回异常（HTTP {status}{'，返回的不是 JSON' if j is None else ''}）。"
+                            "cookie 可能已失效或无权访问。" + jar.hint(), auth=True)
+        return j.get("data")
+    try:
+        return once()
+    except AishError as e:
+        if e.auth and jar.refresh():
+            return once()
+        raise
+
+
+def list_runs(t: Target, jar: CookieJar, n: int = 20) -> list[dict]:
+    q = urllib.parse.quote
+    data = platform_api(t, jar, f"/v1/projects/{q(t.project)}/experiments/{q(t.experiment)}/runs",
+                        {"projectId": t.project, "experimentId": t.experiment, "current": 1, "pageSize": n})
+    rows = data.get("data") if isinstance(data, dict) else data
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    rows.sort(key=lambda r: r.get("createTime") or 0, reverse=True)
+    return rows
+
+
+def list_pods(t: Target, jar: CookieJar, run_id: str) -> list[dict]:
+    q = urllib.parse.quote
+    data = platform_api(t, jar, f"/v1/projects/{q(t.project)}/experiments/{q(t.experiment)}/runs/{q(str(run_id))}/instances")
+    return [x for x in (data or []) if isinstance(x, dict)]
+
+
+def resolve_latest(t: Target, jar: CookieJar) -> None:
+    """把 t 指向实验下最新的运行中 run 里同一角色的 pod（就地修改 t）。"""
+    runs = list_runs(t, jar)
+    running = [r for r in runs if str(r.get("status")) == "Running"]
+    if not running:
+        recent = "，".join(f"{r.get('id')}（{r.get('status')}）" for r in runs[:5]) or "无"
+        raise AishError(f"实验 {t.experiment} 下没有运行中的 run（最近的：{recent}）。"
+                        "如果要连某个 run，用 --run 指定；aish runs <机器名> 查看。", code=3)
+    run = running[0]
+    rid = str(run.get("id"))
+    pods = list_pods(t, jar, rid)
+    ok = [x for x in pods if x.get("status") == "Running" and x.get("showWebshell", True) is not False
+          and x.get("podName")]
+    if not ok:
+        st = "，".join(f"{x.get('podName')}（{x.get('status')}）" for x in pods) or "无"
+        raise AishError(f"run {rid} 还没有可以连接的 pod（{st}）。", code=3)
+    pick = None
+    if t.role:
+        pick = next((x for x in ok if (m := POD_ROLE_RE.search(x["podName"])) and m.group(1) == t.role), None)
+    pick = pick or sorted(ok, key=lambda x: x["podName"])[0]
+    old_run, old_pod = t.run, t.pod
+    t.run, t.pod = rid, pick["podName"]
+    t.container = pick.get("mainContainer") or t.container
+    if len(running) > 1:
+        log(f"实验下有 {len(running)} 个运行中的 run，连接最新的 {rid}（其它：{', '.join(str(r.get('id')) for r in running[1:])}）")
+    if (old_run, old_pod) != (t.run, t.pod):
+        note(f"实验 {t.experiment} 最新的运行中 run 是 {rid}（{run.get('name')}），连接 pod {t.pod}"
+             f"（之前是 run {old_run} / {old_pod}）")
+        if t.name:
+            try:
+                hosts = load_hosts()
+                if t.name in hosts:
+                    hosts[t.name].update(last_run=t.run, last_pod=t.pod)
+                    save_hosts(hosts)
+            except AishError as e:
+                log(f"记录最近的 run 失败：{e}")
+    else:
+        log(f"最新的运行中 run 仍是 {rid}，pod {t.pod}")
+
+
 def do_resize(info: ShellInfo, cookie: str, cols: int, rows: int) -> None:
     q = urllib.parse.urlencode({"cols": cols, "rows": rows, "session": info.session, "cluster": info.cluster})
     status, body = http_get(f"{info.origin}/api/webshell/v1/webshell/opsresize?{q}", cookie, timeout=10)
@@ -472,6 +574,8 @@ async def open_ws(info: ShellInfo, jar: CookieJar, cols: int, rows: int):
 
 
 async def connect_shell(t: Target, jar: CookieJar, cols: int, rows: int):
+    if t.follow:
+        await asyncio.to_thread(resolve_latest, t, jar)
     info = await asyncio.to_thread(fetch_shell, t, jar)
     ws = await open_ws(info, jar, cols, rows)
     return info, ws
@@ -1032,15 +1136,18 @@ def cmd_add(argv: list[str]) -> int:
     g.add_argument("--tmux", metavar="SESSION", default=DEFAULT_TMUX_SESSION,
                    help=f"接入时使用的 tmux 会话名（默认 {DEFAULT_TMUX_SESSION}）")
     g.add_argument("--no-tmux", action="store_true", help="接入普通 shell，不用 tmux（断线不自动重连）")
+    p.add_argument("--pin", action="store_true",
+                   help="固定连这个 run/pod（默认：每次连接都跟随实验下最新的运行中 run）")
     a = p.parse_args(argv)
     if a.name in SUBCOMMANDS or a.name.startswith(("-", "http:", "https:")):
         raise AishError(f"机器名不能是 {a.name!r}")
     t = target_from(a.url)
     hosts = load_hosts()
-    hosts[a.name] = {"url": a.url, "tmux": None if a.no_tmux else a.tmux}
+    hosts[a.name] = {"url": a.url, "tmux": None if a.no_tmux else a.tmux, "follow": not a.pin}
     save_hosts(hosts)
     mode = "普通 shell" if a.no_tmux else f"tmux 会话 {a.tmux}"
-    print(f"已保存 {a.name} → pod {t.pod}（{mode}）。用法：aish {a.name}")
+    where = f"固定 pod {t.pod}" if a.pin else f"实验 {t.experiment} 最新运行中 run 的 {t.role or '同角色'} pod（当前 {t.pod}）"
+    print(f"已保存 {a.name} → {where}（{mode}）。用法：aish {a.name}")
     return 0
 
 
@@ -1053,7 +1160,11 @@ def cmd_ls(argv: list[str]) -> int:
     for n, h in sorted(hosts.items()):
         try:
             t = target_from(h.get("url"))
-            desc = f"pod={t.pod} run={t.run} container={t.container}"
+            if h.get("follow", True):
+                last = h.get("last_pod") or t.pod
+                desc = f"跟随实验 {t.experiment} 最新 run（{t.role or '-'}；最近连接 {last}）"
+            else:
+                desc = f"固定 pod={t.pod} run={t.run}"
         except AishError as e:
             desc = f"（URL 无效：{e}）"
         print(f"{n:<{w}}  {('tmux:' + h['tmux']) if h.get('tmux') else '普通shell':<12}  {desc}")
@@ -1068,6 +1179,27 @@ def cmd_rm(argv: list[str]) -> int:
         raise AishError(f"没有名为 {argv[0]!r} 的机器（aish ls 查看）")
     save_hosts(hosts)
     print(f"已删除 {argv[0]}")
+    return 0
+
+
+def cmd_runs(argv: list[str]) -> int:
+    if len(argv) != 1:
+        raise AishError("用法：aish runs <机器名或 web-shell URL>")
+    t = host_target(argv[0], {})[0]
+    jar = CookieJar(t.base, allow_browser=not os.environ.get("AISH_NO_BROWSER_COOKIE"))
+    runs = list_runs(t, jar, 10)
+    if not runs:
+        print(f"实验 {t.experiment} 下没有 run")
+        return 0
+    latest = next((r for r in runs if r.get("status") == "Running"), None)
+    print(f"实验 {t.experiment} 最近的 run（* 为跟随模式会连接的）：")
+    for r in runs:
+        ts = fmt_time((r.get("startTime") or r.get("createTime") or 0) / 1000 or None)
+        mark = "*" if r is latest else " "
+        print(f" {mark} {r.get('id'):<10} {str(r.get('name')):<16} {str(r.get('status')):<10} 启动 {ts}")
+        if r.get("status") == "Running":
+            for x in list_pods(t, jar, str(r.get("id"))):
+                print(f"       └ {x.get('podName')}  {x.get('status')}  ip={x.get('ip')}")
     return 0
 
 
@@ -1087,7 +1219,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aish", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="AI Studio WebShell 终端客户端（效果类似 ssh -t）。",
-        epilog="子命令：aish add <名字> <URL> [--tmux S|--no-tmux] | aish ls | aish rm <名字> | aish login\n"
+        epilog="子命令：aish add <名字> <URL> [--tmux S|--no-tmux] [--pin] | aish ls | aish rm <名字> | aish runs <名字> | aish login\n"
                "aish <目标> -- <命令...>  连上后自动输入该命令（普通 shell 模式）。\n"
                "交互模式下行首 ~. 断开连接。")
     p.add_argument("target", nargs="?", help="保存的机器名，或平台 web-shell 页面 URL")
@@ -1115,7 +1247,7 @@ def main(argv: list[str]) -> int:
         if sub == "help":
             build_parser().print_help()
             return 0
-        return {"add": cmd_add, "ls": cmd_ls, "rm": cmd_rm, "login": cmd_login}[sub](rest)
+        return {"add": cmd_add, "ls": cmd_ls, "rm": cmd_rm, "runs": cmd_runs, "login": cmd_login}[sub](rest)
 
     initial: list[str] | None = None
     if "--" in argv:
@@ -1131,16 +1263,9 @@ def main(argv: list[str]) -> int:
 
     overrides = {k: getattr(a, k) for k in ("project", "experiment", "run", "pod", "container")}
     tmux = a.tmux
-    if a.target and not a.target.startswith(("http://", "https://")):
-        hosts = load_hosts()
-        if a.target not in hosts:
-            raise AishError(f"未知的机器名 {a.target!r}（aish ls 查看，aish add 添加）")
-        h = hosts[a.target]
-        t = target_from(h.get("url"), overrides)
-        if not a.tmux and not a.no_tmux and initial is None:
-            tmux = h.get("tmux")
-    else:
-        t = target_from(a.target, overrides)
+    t, h = host_target(a.target, overrides)
+    if h is not None and not a.tmux and not a.no_tmux and initial is None:
+        tmux = h.get("tmux")
 
     allow_browser = not (a.no_browser_cookie or os.environ.get("AISH_NO_BROWSER_COOKIE"))
     jar = CookieJar(t.base, allow_browser)

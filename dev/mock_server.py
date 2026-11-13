@@ -25,7 +25,23 @@ def setsize(fd, cols, rows):
 async def process_request(conn, req):
     path, _, query = req.path.partition("?")
     q = dict(urllib.parse.parse_qsl(query))
+    if path.endswith("/runs") or path.endswith("/instances"):
+        if not cookie_ok(req.headers):
+            return conn.respond(HTTPStatus.UNAUTHORIZED, '{"code":401,"msg":"unauthorized"}')
+        # 数据来自 MOCK_RUNS_FILE（测试中途可修改，模拟换 run）
+        try:
+            runs = json.load(open(os.environ["MOCK_RUNS_FILE"]))
+        except (KeyError, OSError, ValueError):
+            return conn.respond(HTTPStatus.NOT_FOUND, "nf")
+        if path.endswith("/runs"):
+            data = {"data": [{k: v for k, v in r.items() if k != "pods"} for r in runs],
+                    "info": {"current": 1, "pageSize": 20, "total": len(runs)}}
+        else:
+            rid = path.split("/runs/")[1].split("/")[0]
+            data = next((r.get("pods", []) for r in runs if str(r["id"]) == rid), [])
+        return conn.respond(HTTPStatus.OK, json.dumps({"code": 200, "msg": "OK", "data": data}))
     if path.endswith("/webshellUrl"):
+        LOG.write(f"webshellUrl run={path.split('/runs/')[1].split('/')[0]} instance={q.get('instance')}\n")
         if not cookie_ok(req.headers):
             return conn.respond(HTTPStatus.UNAUTHORIZED, '{"code":401,"msg":"unauthorized"}')
         counter[0] += 1
@@ -96,6 +112,8 @@ async def handler(ws):
         async for m in ws:
             if m == "":
                 hb += 1; LOG.write(f"heartbeat {hb}\n"); continue
+            if os.environ.get("MOCK_LOG_INPUT"):
+                LOG.write(f"input {m!r}\n")
             os.write(fd, m.encode() if isinstance(m, str) else m)
     t1 = asyncio.create_task(pump_out()); t2 = asyncio.create_task(pump_in())
     await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
