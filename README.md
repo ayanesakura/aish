@@ -103,6 +103,19 @@ Herdr 的远端机器固定在一个 pod 上，不会自己跟到新 run（否�
 
 脚本会固定当前 pod，自动注册原生远端机器、安装 Herdr Core、检查 Bash/Node、创建独立远端 space 并切换过去。同一 pod 和目录重复执行会复用 space；不同 pod 分别注册，不覆盖旧连接。新 space 优先接入 tmux `main`，没有它才启动已安装的 Claude。未安装 Claude 时打开远端 shell 并返回警告；不会自动改认证或安装 Claude/Node。
 
+### pod 准备脚本（有网盘持久化 HOME 时需要）
+如果 pod 上有一个把 `~/.local` 等目录换成网盘软链的初始化脚本，它必须先于 Herdr Core 的安装执行。否则装好的 Core 连同它的身份会被换成网盘上的旧副本，之后任何一次重连 Herdr 都会报 `a different core answers there`，space 随之消失。
+
+把这段初始化写进本机的 `~/.config/ais-webshell/herdr-prepare.sh`（可用 `AISH_HERDR_PREPARE` 改路径）。文件存在且非空时，`herdr-pod` 每次接入都先通过普通 WebShell 在 pod 上用 Bash 跑它一遍，成功后才注册机器；脚本失败则中止接入，不注册。脚本要能重复执行，并且在没有这套初始化的 pod 上直接退出 0，例如：
+
+```sh
+B=/path/to/persist/bootstrap.sh
+[ -f "$B" ] || exit 0
+[ -e /tmp/.persist-bootstrapped ] || { bash "$B" && touch /tmp/.persist-bootstrapped; }
+```
+
+已经出现 `a different core answers there` 的机器，这个脚本救不回来：确认旧 Core 里没有要保留的终端后，`hc machine rm <机器名>` 再重新接入。
+
 默认目录按 `/workspace/verl`、`/workspace`、HOME 的存在顺序选择。现有 Herdr TOML 保留原有选项，仅补充缺失的 `shell`，改写前生成同目录备份。Node 仅将 nvm 已安装的默认版本链接到 PATH 中的 `~/.local/bin/node`，不覆盖已有文件。
 
 安装产物在 `~/.local/share/aish/releases/`，`current` 指向当前版本；旧版本保留，已注册机器的传输命令固定到具体版本。共享 skill 链接在 `~/.agents/skills/herdr-pod`（Codex）和 `~/.claude/skills/herdr-pod`（Claude Code）。若当前对话未发现新 skill，开启新会话；命令行入口安装后即可使用。更新后重跑安装命令即可；遇到非本工具已有文件会拒绝覆盖。

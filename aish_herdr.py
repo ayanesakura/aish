@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
@@ -12,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import urllib.parse
 
 import tomlkit
@@ -89,6 +91,22 @@ def resolve_target(name, latest, api, jar):
     return target
 
 
+DEFAULT_PREPARE_FILE = "~/.config/ais-webshell/herdr-prepare.sh"
+PREPARE_TIMEOUT = 600
+
+
+def prepare_script(api):
+    """本机的 pod 准备脚本内容；没有该文件或内容为空时返回 None。"""
+    path = Path(api.config_path("AISH_HERDR_PREPARE", DEFAULT_PREPARE_FILE))
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as error:
+        raise api.AishError(f"无法读取 pod 准备脚本 {path}：{error}")
+    return text if text.strip() else None
+
+
 def shell_config(text):
     document = tomlkit.parse(text)
     if "shell" in document:
@@ -128,7 +146,31 @@ class Connector:
         return self.data("hc", "exec", "--on", machine, "-i", "python3", "-",
                          action, json.dumps(payload), source=source)
 
-    def attach(self, target, name=None, folder=None):
+    def prepare(self, url, script):
+        """注册前在 pod 上跑一遍准备脚本（走普通 WebShell，不依赖 Herdr Core）。
+
+        会替换 ~/.local 的环境初始化必须先于安装 Herdr Core，否则装好的 Core 连同它的身份
+        会被换掉，之后重连时 Herdr 认不出这台机器。
+        """
+        encoded = base64.b64encode(script.encode()).decode()
+        runtime = Path(__file__).resolve().with_name("aish.py")
+        self.api.note("在 pod 上运行准备脚本")
+        self.run("uv", "run", "--quiet", "--script", str(runtime), url,
+                 "--exec", f"echo {encoded} | base64 -d | /bin/bash",
+                 "--timeout", str(PREPARE_TIMEOUT), timeout=PREPARE_TIMEOUT + 60)
+
+    def new_space(self, payload):
+        """机器刚注册时窗口这一侧可能还在连接，等它连上再建 space。"""
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                return self.data("herdr-app", "do", "space.new", json.dumps(payload))
+            except self.api.AishError as error:
+                if "is connecting" not in str(error) or time.monotonic() > deadline:
+                    raise
+                time.sleep(2)
+
+    def attach(self, target, name=None, folder=None, prepare=None):
         url = canonical_url(target)
         machines = self.data("hc", "machine", "ls")["machines"]
         matching = [machine for machine in machines
@@ -140,6 +182,8 @@ class Connector:
         collision = next((machine for machine in machines if machine["name"] == desired), None)
         if collision and collision not in matching:
             raise self.api.AishError(f"机器名 {desired} 已被其他连接使用，请换一个 --name。")
+        if prepare:
+            self.prepare(url, prepare)
         if matching:
             machine = (collision or matching[0])["name"]
             self.api.note(f"复用远端机器 {machine}")
@@ -173,10 +217,10 @@ class Connector:
             else:
                 argv, tab = ["/bin/bash", "--norc"], "Terminal"
             self.api.note(f"创建绑定 {machine} 的独立 space")
-            self.data("herdr-app", "do", "space.new", json.dumps({
+            self.new_space({
                 "name": f"Pod {target.run} · {target.role or target.container}",
                 "machine": machine, "folder": probe["folder"], "argv": argv, "tab": tab,
-            }))
+            })
             spaces = self.data("herdr-app", "ls")["spaces"]
             existing = next((space for space in spaces if space.get("machine") == machine
                              and space.get("folder") == probe["folder"]), None)
@@ -216,7 +260,7 @@ def connect(argv, api):
         except BlockingIOError:
             raise api.AishError("另一个 Herdr 接入任务正在执行，请等待其完成后重试。")
         connector = Connector(api, tools)
-        result = connector.attach(target, args.name, args.folder)
+        result = connector.attach(target, args.name, args.folder, prepare_script(api))
         try:
             result["stale_machines"] = stale_machines(
                 connector.data("hc", "machine", "ls")["machines"], target, api.list_runs(target, jar), api)
