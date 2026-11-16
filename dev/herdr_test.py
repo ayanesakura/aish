@@ -1,5 +1,6 @@
 """Isolated tests for native remote-space onboarding and shared installation."""
 
+import base64
 import importlib.util
 import json
 import os
@@ -13,8 +14,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import aish
-from aish_herdr import (Connector, canonical_url, identity, machine_name, resolve_target, shell_config,
-                        stale_machines, via_target)
+from aish_herdr import (Connector, canonical_url, identity, machine_name, prepare_script, resolve_target,
+                        shell_config, stale_machines, via_target)
 import install as installer
 
 spec = importlib.util.spec_from_file_location("herdr_setup", Path(__file__).resolve().parents[1] / "remote/herdr_setup.py")
@@ -32,6 +33,8 @@ class FakeConnector(Connector):
         self.added = 0
         self.created = 0
         self.wrong_binding = False
+        self.calls = []
+        self.connecting = 0
         self.probe = {"folder": "/workspace/verl", "config": "notes = false\n",
                       "node_source": None, "warnings": [], "tmux_main": True,
                       "tmux": "/usr/bin/tmux", "claude": "/home/work/.local/bin/claude"}
@@ -42,6 +45,12 @@ class FakeConnector(Connector):
         return {"warnings": [], "config_backup": "/config.backup"}
 
     def run(self, tool, *args, **kwargs):
+        self.calls.append((tool, args))
+        if tool == "uv":
+            return ""
+        if args[:2] == ("do", "space.new") and self.connecting:
+            self.connecting -= 1
+            return json.dumps({"error": "pod is connecting"})
         if args[:2] == ("machine", "ls"):
             return json.dumps({"machines": self.machines})
         if args[:2] == ("machine", "add"):
@@ -137,6 +146,55 @@ class OnboardingTests(unittest.TestCase):
         stale = stale_machines(machines, aish.target_from(URL), runs, aish)
         self.assertEqual([(item["machine"], item["status"]) for item in stale],
                          [("ended", "Stopped"), ("unlisted", "不在最近的 run 列表中")])
+
+    def test_prepare_script_runs_on_pod_before_core_install(self):
+        connector = FakeConnector()
+        script = "[ -f /persist/bootstrap.sh ] || exit 0\nbash /persist/bootstrap.sh\n"
+        connector.attach(aish.target_from(URL), prepare=script)
+        steps = [(tool, args[:2]) for tool, args in connector.calls]
+        prepared = next(index for index, (tool, _) in enumerate(steps) if tool == "uv")
+        self.assertLess(prepared, steps.index(("hc", ("machine", "add"))))
+        args = connector.calls[prepared][1]
+        self.assertEqual(args[4], canonical_url(aish.target_from(URL)))
+        command = args[args.index("--exec") + 1]
+        self.assertEqual(base64.b64decode(command.split()[1]).decode(), script)
+        self.assertNotIn("\n", command)
+        connector.attach(aish.target_from(URL), prepare=script)
+        self.assertEqual(sum(tool == "uv" for tool, _ in connector.calls), 2)
+        self.assertEqual(connector.added, 1)
+
+    def test_no_prepare_script_means_no_extra_connection(self):
+        connector = FakeConnector()
+        connector.attach(aish.target_from(URL))
+        self.assertFalse([tool for tool, _ in connector.calls if tool == "uv"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "herdr-prepare.sh"
+            with patch.dict(os.environ, {"AISH_HERDR_PREPARE": str(path)}):
+                self.assertIsNone(prepare_script(aish))
+                path.write_text("  \n")
+                self.assertIsNone(prepare_script(aish))
+                path.write_text("true\n")
+                self.assertEqual(prepare_script(aish), "true\n")
+
+    def test_failed_prepare_script_stops_before_registration(self):
+        connector = FakeConnector()
+
+        def failing(tool, *args, **kwargs):
+            raise aish.AishError("uv 执行失败：bootstrap 出错")
+
+        with patch.object(connector, "run", side_effect=failing):
+            with self.assertRaises(aish.AishError):
+                connector.attach(aish.target_from(URL), prepare="false\n")
+        self.assertEqual((connector.added, connector.created), (0, 0))
+
+    def test_space_creation_waits_while_machine_is_connecting(self):
+        connector = FakeConnector()
+        connector.connecting = 2
+        with patch("aish_herdr.time.sleep") as slept:
+            result = connector.attach(aish.target_from(URL))
+        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(connector.created, 1)
+        self.assertTrue(result["created"])
 
     def test_name_collision_refuses_without_changes(self):
         connector = FakeConnector()

@@ -33,6 +33,8 @@ description: 把 AI Studio 训练 pod 接入本机 Herdr，创建独立的原生
 - 不确定哪里出了问题：运行 `"$HOME/.local/bin/aish" doctor`，它只读地检查 cookie、保存的机器、Herdr 机器状态和 pod 上的 claude/node/tmux。
 - 缺少 `hc`、`herdr-app` 或 `uv`：报告缺少项；不把本地终端伪装为远端接入。
 - 中途失败：用相同 URL 重试；已经创建的机器/space 会复用。不要移除旧机器或反复新建 Claude 来“修复”。
+- 机器 unreachable 且原因为 `a different core answers there`：pod 上的 `~/.local` 在接入后被环境初始化脚本换掉了，重试不会恢复。向用户说明原因；由用户确认旧 Core 里没有要保留的终端后，`hc machine rm <机器名>` 再重新接入。若本机没有 `~/.config/ais-webshell/herdr-prepare.sh`，提醒用户按 README「pod 准备脚本」配置，避免下一个 pod 重演。
+- 输出“在 pod 上运行准备脚本”后失败：这是用户自己的 `herdr-prepare.sh` 在 pod 上出错，机器尚未注册；报告脚本输出，不要绕过它直接注册。
 - pod 缺少 Claude/Node、账号未配置：保留可用的远端终端，说明具体缺项。没有用户授权时不改 Claude 认证、hooks、权限、plugins 或 MCP。
 - 响应慢：分别计时 `hc exec --on MACHINE /bin/true` 与 `hc read MACHINE/tN`，再看 pod 进程状态。连接正常不代表 Claude 或文件系统正常；不要直接归因为网络，也不要自动重启训练/Claude。
 
